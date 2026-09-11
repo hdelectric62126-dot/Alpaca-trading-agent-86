@@ -24,6 +24,8 @@ This starter project is intentionally locked to **Alpaca paper trading**.
   it never changes trading rules or places orders.
 - Uses an Exit Agent with an unchangeable hard stop, momentum-aware profit
   taking, an extended profit target, and trailing profit protection.
+- Uses a Risk Agent to approve and size every new paper entry, cap total
+  exposure, limit concurrent positions, and enforce daily guardrails.
 
 This is a test framework, not a guarantee of profit.
 
@@ -55,6 +57,8 @@ Recommended starter settings:
 - `PERFORMANCE_MIN_TRADES` = `10`
 - `TRAILING_ARM_PCT` = `0.35`
 - `TRAILING_GAP_PCT` = `0.20`
+- `MAX_TOTAL_EXPOSURE` = `75`
+- `MAX_OPEN_POSITIONS` = `3`
 
 ## Railway persistent journal storage
 

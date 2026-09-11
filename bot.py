@@ -1,6 +1,7 @@
 import os
 import time
 import math
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -17,6 +18,7 @@ from scout import MarketScout
 from journal import PerformanceAnalyzer, TradeJournal
 from performance_agent import PerformanceAgent
 from exit_agent import ExitAgent
+from risk_agent import RiskAgent
 
 
 # ---------------------------
@@ -47,6 +49,8 @@ PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
 TRAILING_ARM_PCT = float(os.getenv("TRAILING_ARM_PCT", "0.35")) / 100.0
 TRAILING_GAP_PCT = float(os.getenv("TRAILING_GAP_PCT", "0.20")) / 100.0
+MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "75"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -55,6 +59,14 @@ scout = MarketScout(ENTRY_DIP_PCT, MIN_SIGNAL_SCORE, SCOUT_TOP_N)
 performance_agent = PerformanceAgent(journal, PERFORMANCE_MIN_TRADES)
 exit_agent = ExitAgent(TAKE_PROFIT_PCT, STOP_LOSS_PCT,
                        TRAILING_ARM_PCT, TRAILING_GAP_PCT)
+risk_agent = RiskAgent(
+    minimum_score=MIN_SIGNAL_SCORE,
+    max_trade_notional=MAX_TRADE_NOTIONAL,
+    max_total_exposure=MAX_TOTAL_EXPOSURE,
+    max_open_positions=MAX_OPEN_POSITIONS,
+    daily_profit_target=DAILY_PROFIT_TARGET,
+    daily_loss_limit=DAILY_LOSS_LIMIT,
+)
 
 
 def market_is_open():
@@ -110,8 +122,8 @@ def recent_bars(symbol):
     return bars
 
 
-def submit_buy(symbol, price):
-    notional = min(MAX_TRADE_NOTIONAL, max(1.0, MAX_TRADE_NOTIONAL))
+def submit_buy(symbol, price, notional):
+    notional = min(MAX_TRADE_NOTIONAL, max(1.0, float(notional)))
     order = MarketOrderRequest(
         symbol=symbol,
         notional=round(notional, 2),
@@ -251,17 +263,22 @@ def run():
                 threshold = mean_price * (1 - ENTRY_DIP_PCT)
                 signal = score_signal(bars, ENTRY_DIP_PCT)
                 print(f"[SIGNAL] {symbol} score={signal.score}/100 | " + "; ".join(signal.reasons))
-                if (
-                    symbol in candidates
-                    and not has_open_order(symbol)
-                ):
-                    order, notional = submit_buy(symbol, last_price)
+                order_exists = has_open_order(symbol)
+                risk = risk_agent.assess(
+                    score=signal.score, positions=pos, daily_pnl=pnl,
+                    has_open_order=order_exists,
+                )
+                if symbol in candidates and risk.approved:
+                    order, notional = submit_buy(symbol, last_price, risk.notional)
                     quantity = notional / last_price
                     journal.record_cycle(symbol=symbol, current_price=last_price,
                                          market_data=bar_data(bars), signal=signal, decision="BUY",
                                          order=order, quantity=quantity, entry_price=last_price)
                     journal.record_trade(symbol=symbol, score=signal.score, quantity=quantity,
                                          entry_price=last_price, order_id=order.id, status="OPEN")
+                    # Reserve this exposure immediately for later symbols in the
+                    # same scan instead of waiting for Alpaca's next refresh.
+                    pos[symbol] = SimpleNamespace(market_value=notional)
                 else:
                     rejection_reason = []
                     if last_price > threshold:
@@ -270,8 +287,8 @@ def run():
                         rejection_reason.append(f"score {signal.score} is below minimum {MIN_SIGNAL_SCORE}")
                     if last_price <= threshold and signal.score >= MIN_SIGNAL_SCORE and symbol not in candidates:
                         rejection_reason.append(f"not in scout's top {SCOUT_TOP_N} opportunities")
-                    if has_open_order(symbol):
-                        rejection_reason.append("an open paper order already exists")
+                    if not risk.approved:
+                        rejection_reason.append("risk agent: " + risk.reason)
                     rejection_reason = "; ".join(rejection_reason)
                     print(
                         f"[WAIT] {symbol} last={last_price:.2f} "
