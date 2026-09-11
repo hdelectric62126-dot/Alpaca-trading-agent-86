@@ -4,7 +4,10 @@ This starter project is intentionally locked to **Alpaca paper trading**.
 
 ## What it does
 
-- Watches AMD, TSM, and TSLA by default.
+- Runs a market-scanner agent across AMD, TSM, TSLA, NVDA, AAPL, MSFT,
+  AMZN, META, GOOGL, and AVGO by default.
+- Ranks every setup and feeds only the strongest three eligible opportunities
+  to the execution agent.
 - Calculates a short rolling average from 1-minute bars.
 - Scores each possible entry from 0 to 100 using the dip, RSI, VWAP, volume, and improving momentum.
 - Writes plain-English scoring reasons to the Railway logs.
@@ -30,7 +33,7 @@ Required:
 
 Recommended starter settings:
 
-- `SYMBOLS` = `AMD,TSM,TSLA`
+- `SYMBOLS` = `AMD,TSM,TSLA,NVDA,AAPL,MSFT,AMZN,META,GOOGL,AVGO`
 - `LOOKBACK_MINUTES` = `30`
 - `ENTRY_DIP_PCT` = `0.35`
 - `TAKE_PROFIT_PCT` = `0.45`
@@ -40,6 +43,7 @@ Recommended starter settings:
 - `DAILY_LOSS_LIMIT` = `10`
 - `POLL_SECONDS` = `60`
 - `MIN_SIGNAL_SCORE` = `60`
+- `SCOUT_TOP_N` = `3`
 - `JOURNAL_DB_PATH` = `/data/trading_journal.db`
 
 ## Railway persistent journal storage

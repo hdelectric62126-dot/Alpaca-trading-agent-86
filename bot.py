@@ -13,6 +13,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 from strategy import score_signal
+from scout import MarketScout
 from journal import PerformanceAnalyzer, TradeJournal
 
 
@@ -27,7 +28,9 @@ API_KEY = os.environ["APCA_API_KEY_ID"]
 SECRET_KEY = os.environ["APCA_API_SECRET_KEY"]
 
 # Trading configuration
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AMD,TSM,TSLA").split(",") if s.strip()]
+SYMBOLS = [s.strip().upper() for s in os.getenv(
+    "SYMBOLS", "AMD,TSM,TSLA,NVDA,AAPL,MSFT,AMZN,META,GOOGL,AVGO"
+).split(",") if s.strip()]
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "30"))
 ENTRY_DIP_PCT = float(os.getenv("ENTRY_DIP_PCT", "0.35")) / 100.0
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.45")) / 100.0
@@ -37,10 +40,12 @@ DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "10"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "10"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
+SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 journal = TradeJournal()
+scout = MarketScout(ENTRY_DIP_PCT, MIN_SIGNAL_SCORE, SCOUT_TOP_N)
 
 
 def market_is_open():
@@ -173,10 +178,27 @@ def run():
 
             pos = positions()
 
+            # Agent #2: collect and rank the entire watchlist before Agent #1
+            # is allowed to consider a new entry.
+            bars_by_symbol = {}
             for symbol in SYMBOLS:
                 bars = recent_bars(symbol)
                 if bars is None or bars.empty:
                     print(f"[data] Not enough bars for {symbol}")
+                else:
+                    bars_by_symbol[symbol] = bars
+
+            ranked = scout.rank(bars_by_symbol)
+            candidates = {item.symbol for item in scout.candidates(ranked)}
+            leaderboard = ", ".join(
+                f"{item.symbol}:{item.signal.score}{'*' if item.symbol in candidates else ''}"
+                for item in ranked[:5]
+            ) or "no market data"
+            print(f"[SCOUT] ranked={leaderboard} | * passed to execution agent")
+
+            for symbol in SYMBOLS:
+                bars = bars_by_symbol.get(symbol)
+                if bars is None:
                     continue
 
                 last_price = float(bars["close"].iloc[-1])
@@ -230,8 +252,7 @@ def run():
                 signal = score_signal(bars, ENTRY_DIP_PCT)
                 print(f"[SIGNAL] {symbol} score={signal.score}/100 | " + "; ".join(signal.reasons))
                 if (
-                    last_price <= threshold
-                    and signal.score >= MIN_SIGNAL_SCORE
+                    symbol in candidates
                     and not has_open_order(symbol)
                 ):
                     order, notional = submit_buy(symbol, last_price)
@@ -247,6 +268,8 @@ def run():
                         rejection_reason.append("price is not below the dip threshold")
                     if signal.score < MIN_SIGNAL_SCORE:
                         rejection_reason.append(f"score {signal.score} is below minimum {MIN_SIGNAL_SCORE}")
+                    if last_price <= threshold and signal.score >= MIN_SIGNAL_SCORE and symbol not in candidates:
+                        rejection_reason.append(f"not in scout's top {SCOUT_TOP_N} opportunities")
                     if has_open_order(symbol):
                         rejection_reason.append("an open paper order already exists")
                     rejection_reason = "; ".join(rejection_reason)
