@@ -13,6 +13,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 from strategy import score_signal
+from journal import PerformanceAnalyzer, TradeJournal
 
 
 # ---------------------------
@@ -39,6 +40,7 @@ MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+journal = TradeJournal()
 
 
 def market_is_open():
@@ -103,7 +105,8 @@ def submit_buy(symbol, price):
         time_in_force=TimeInForce.DAY,
     )
     result = trading.submit_order(order_data=order)
-    print(f"[BUY] {symbol} approx ${notional:.2f} near {price:.2f} | order={result.id}")
+    print(f"[PAPER BUY] {symbol} approx ${notional:.2f} near {price:.2f} | order={result.id}")
+    return result, notional
 
 
 def submit_sell(symbol, qty, reason):
@@ -117,7 +120,23 @@ def submit_sell(symbol, qty, reason):
         time_in_force=TimeInForce.DAY,
     )
     result = trading.submit_order(order_data=order)
-    print(f"[SELL] {symbol} qty={qty} reason={reason} | order={result.id}")
+    print(f"[PAPER SELL] {symbol} qty={qty} reason={reason} | order={result.id}")
+    return result
+
+
+def bar_data(bars):
+    row = bars.iloc[-1]
+    return {name: float(value) for name, value in row.items() if name in {"open", "high", "low", "close", "volume", "trade_count", "vwap"}}
+
+
+def daily_summary():
+    report = PerformanceAnalyzer(journal).report(1)
+    print(
+        f"[PAPER DAILY] signals={report['signals']} accepted={report['accepted_signals']} "
+        f"rejected={report['rejected_signals']} trades={report['paper_trades']} "
+        f"wins={report['wins']} losses={report['losses']} "
+        f"P/L=${report['total_profit_loss']:.2f} drawdown=${report['maximum_drawdown']:.2f}"
+    )
 
 
 def run():
@@ -125,6 +144,7 @@ def run():
     print("Paper agent started.")
     print(f"Symbols: {SYMBOLS}")
     print(f"Starting paper equity: ${start_equity:,.2f}")
+    last_summary_date = None
 
     while True:
         try:
@@ -146,6 +166,11 @@ def run():
                 time.sleep(POLL_SECONDS)
                 continue
 
+            current_date = datetime.now(timezone.utc).date()
+            if current_date != last_summary_date:
+                daily_summary()
+                last_summary_date = current_date
+
             pos = positions()
 
             for symbol in SYMBOLS:
@@ -165,15 +190,38 @@ def run():
 
                     if last_price >= entry * (1 + TAKE_PROFIT_PCT):
                         if not has_open_order(symbol):
-                            submit_sell(symbol, qty, "take profit")
+                            order = submit_sell(symbol, qty, "take profit")
+                            journal.record_cycle(
+                                symbol=symbol, current_price=last_price, market_data=bar_data(bars),
+                                signal=score_signal(bars, ENTRY_DIP_PCT), decision="SELL", order=order,
+                                quantity=qty, entry_price=entry, exit_price=last_price,
+                                realized_pnl=(last_price - entry) * qty,
+                            )
+                            journal.close_trade(symbol=symbol, exit_price=last_price,
+                                                realized_pnl=(last_price - entry) * qty,
+                                                order_id=order.id)
                     elif last_price <= entry * (1 - STOP_LOSS_PCT):
                         if not has_open_order(symbol):
-                            submit_sell(symbol, qty, "stop loss")
+                            order = submit_sell(symbol, qty, "stop loss")
+                            journal.record_cycle(
+                                symbol=symbol, current_price=last_price, market_data=bar_data(bars),
+                                signal=score_signal(bars, ENTRY_DIP_PCT), decision="SELL", order=order,
+                                quantity=qty, entry_price=entry, exit_price=last_price,
+                                realized_pnl=(last_price - entry) * qty,
+                            )
+                            journal.close_trade(symbol=symbol, exit_price=last_price,
+                                                realized_pnl=(last_price - entry) * qty,
+                                                order_id=order.id)
                     else:
+                        signal = score_signal(bars, ENTRY_DIP_PCT)
                         print(
                             f"[HOLD] {symbol} last={last_price:.2f} entry={entry:.2f} "
                             f"mean={mean_price:.2f}"
                         )
+                        journal.record_cycle(symbol=symbol, current_price=last_price,
+                                             market_data=bar_data(bars), signal=signal, decision="HOLD",
+                                             quantity=qty, entry_price=entry,
+                                             unrealized_pnl=(last_price - entry) * qty)
                     continue
 
                 # One simple mean-reversion entry:
@@ -186,13 +234,30 @@ def run():
                     and signal.score >= MIN_SIGNAL_SCORE
                     and not has_open_order(symbol)
                 ):
-                    submit_buy(symbol, last_price)
+                    order, notional = submit_buy(symbol, last_price)
+                    quantity = notional / last_price
+                    journal.record_cycle(symbol=symbol, current_price=last_price,
+                                         market_data=bar_data(bars), signal=signal, decision="BUY",
+                                         order=order, quantity=quantity, entry_price=last_price)
+                    journal.record_trade(symbol=symbol, score=signal.score, quantity=quantity,
+                                         entry_price=last_price, order_id=order.id, status="OPEN")
                 else:
+                    rejection_reason = []
+                    if last_price > threshold:
+                        rejection_reason.append("price is not below the dip threshold")
+                    if signal.score < MIN_SIGNAL_SCORE:
+                        rejection_reason.append(f"score {signal.score} is below minimum {MIN_SIGNAL_SCORE}")
+                    if has_open_order(symbol):
+                        rejection_reason.append("an open paper order already exists")
+                    rejection_reason = "; ".join(rejection_reason)
                     print(
                         f"[WAIT] {symbol} last={last_price:.2f} "
                         f"mean={mean_price:.2f} trigger<={threshold:.2f} "
                         f"score>={MIN_SIGNAL_SCORE}"
                     )
+                    journal.record_cycle(symbol=symbol, current_price=last_price,
+                                         market_data=bar_data(bars), signal=signal, decision="REJECT",
+                                         rejection_reason=rejection_reason)
 
             time.sleep(POLL_SECONDS)
 

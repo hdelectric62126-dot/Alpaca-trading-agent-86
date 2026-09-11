@@ -13,6 +13,8 @@ This starter project is intentionally locked to **Alpaca paper trading**.
 - Uses a configurable take-profit and stop-loss.
 - Stops opening new positions after the configured daily paper profit target or daily paper loss limit is reached.
 - Includes a walk-forward historical backtester for AMD, TSM, and TSLA.
+- Persists every paper analysis cycle and paper trade in a SQLite journal.
+- Provides 1-, 7-, and 30-day paper performance reports without placing orders.
 
 This is a test framework, not a guarantee of profit.
 
@@ -38,6 +40,15 @@ Recommended starter settings:
 - `DAILY_LOSS_LIMIT` = `10`
 - `POLL_SECONDS` = `60`
 - `MIN_SIGNAL_SCORE` = `60`
+- `JOURNAL_DB_PATH` = `/data/trading_journal.db`
+
+## Railway persistent journal storage
+
+Create a Railway Volume for the service and mount it at `/data`. Keep
+`JOURNAL_DB_PATH=/data/trading_journal.db` so the SQLite paper journal survives
+deploys and restarts. Without a mounted volume, the journal is ephemeral to
+the container. The journal contains paper-trading records only; never store
+Alpaca API keys in it or in the repository.
 
 ## Important
 
@@ -61,4 +72,14 @@ The backtester processes each historical bar in order and reports ending cash, r
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+## Generate a paper report
+
+These commands only read SQLite and never contact Alpaca or place orders:
+
+```bash
+python report.py --days 1
+python report.py --days 7
+python report.py --days 30
 ```

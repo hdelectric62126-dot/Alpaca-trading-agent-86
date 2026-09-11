@@ -7,4 +7,6 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+*.db
+*.db-journal
 .DS_Store

@@ -14,6 +14,7 @@ class Signal:
     price_vs_vwap_pct: float
     volume_ratio: float
     momentum_pct: float
+    component_scores: dict[str, int]
 
 
 def _rsi(closes: pd.Series, period: int = 14) -> float:
@@ -49,35 +50,46 @@ def score_signal(bars: pd.DataFrame, dip_threshold: float = 0.0035) -> Signal:
 
     points = 0
     reasons = []
+    component_scores = {}
     if dip_pct >= dip_threshold:
         points += 20
+        component_scores["dip"] = 20
         reasons.append(f"dip {dip_pct * 100:.2f}% meets {dip_threshold * 100:.2f}% target (+20)")
     else:
+        component_scores["dip"] = 0
         reasons.append(f"dip {dip_pct * 100:.2f}% is below {dip_threshold * 100:.2f}% target (+0)")
 
     if 30 <= rsi <= 55:
         points += 20
+        component_scores["rsi"] = 20
         reasons.append(f"RSI {rsi:.1f} is in a recovery range (+20)")
     else:
+        component_scores["rsi"] = 0
         reasons.append(f"RSI {rsi:.1f} is outside the recovery range (+0)")
 
     price_vs_vwap_pct = (last_price / vwap) - 1
     if last_price >= vwap:
         points += 20
+        component_scores["vwap"] = 20
         reasons.append(f"price is {price_vs_vwap_pct * 100:.2f}% above VWAP (+20)")
     else:
+        component_scores["vwap"] = 0
         reasons.append(f"price is {abs(price_vs_vwap_pct) * 100:.2f}% below VWAP (+0)")
 
     if volume_ratio >= 1.2:
         points += 20
+        component_scores["volume"] = 20
         reasons.append(f"volume is {volume_ratio:.2f}x its recent average (+20)")
     else:
+        component_scores["volume"] = 0
         reasons.append(f"volume is {volume_ratio:.2f}x its recent average (+0)")
 
     if momentum_pct > prior_momentum_pct:
         points += 20
+        component_scores["momentum"] = 20
         reasons.append("short-term momentum is improving (+20)")
     else:
+        component_scores["momentum"] = 0
         reasons.append("short-term momentum is not improving (+0)")
 
     return Signal(
@@ -88,6 +100,7 @@ def score_signal(bars: pd.DataFrame, dip_threshold: float = 0.0035) -> Signal:
         price_vs_vwap_pct=price_vs_vwap_pct,
         volume_ratio=volume_ratio,
         momentum_pct=momentum_pct,
+        component_scores=component_scores,
     )
 
 
