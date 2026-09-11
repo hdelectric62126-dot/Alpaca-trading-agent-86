@@ -12,6 +12,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
+from strategy import score_signal
+
 
 # ---------------------------
 # PAPER-TRADING SAFETY GUARDS
@@ -33,6 +35,7 @@ MAX_TRADE_NOTIONAL = float(os.getenv("MAX_TRADE_NOTIONAL", "25"))
 DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "10"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "10"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -176,12 +179,19 @@ def run():
                 # One simple mean-reversion entry:
                 # buy when last price is ENTRY_DIP_PCT below the rolling mean.
                 threshold = mean_price * (1 - ENTRY_DIP_PCT)
-                if last_price <= threshold and not has_open_order(symbol):
+                signal = score_signal(bars, ENTRY_DIP_PCT)
+                print(f"[SIGNAL] {symbol} score={signal.score}/100 | " + "; ".join(signal.reasons))
+                if (
+                    last_price <= threshold
+                    and signal.score >= MIN_SIGNAL_SCORE
+                    and not has_open_order(symbol)
+                ):
                     submit_buy(symbol, last_price)
                 else:
                     print(
                         f"[WAIT] {symbol} last={last_price:.2f} "
-                        f"mean={mean_price:.2f} trigger<={threshold:.2f}"
+                        f"mean={mean_price:.2f} trigger<={threshold:.2f} "
+                        f"score>={MIN_SIGNAL_SCORE}"
                     )
 
             time.sleep(POLL_SECONDS)

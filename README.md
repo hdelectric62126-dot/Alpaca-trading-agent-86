@@ -6,10 +6,13 @@ This starter project is intentionally locked to **Alpaca paper trading**.
 
 - Watches AMD, TSM, and TSLA by default.
 - Calculates a short rolling average from 1-minute bars.
-- Looks for a small dip below that average.
+- Scores each possible entry from 0 to 100 using the dip, RSI, VWAP, volume, and improving momentum.
+- Writes plain-English scoring reasons to the Railway logs.
+- Requires the configurable signal score before any paper buy.
 - Places a small paper market buy when the configured dip threshold is met.
 - Uses a configurable take-profit and stop-loss.
 - Stops opening new positions after the configured daily paper profit target or daily paper loss limit is reached.
+- Includes a walk-forward historical backtester for AMD, TSM, and TSLA.
 
 This is a test framework, not a guarantee of profit.
 
@@ -34,6 +37,7 @@ Recommended starter settings:
 - `DAILY_PROFIT_TARGET` = `10`
 - `DAILY_LOSS_LIMIT` = `10`
 - `POLL_SECONDS` = `60`
+- `MIN_SIGNAL_SCORE` = `60`
 
 ## Important
 
@@ -42,3 +46,19 @@ Do not put API keys in GitHub files.
 The U.S.-listed ADR ticker for Taiwan Semiconductor Manufacturing Company is `TSM`, not `TSMC`.
 
 Before using real money, paper-test the strategy over many market sessions and review fills, slippage, losses, and behavior around volatile moves.
+
+## Run the backtester
+
+With the same Alpaca API variables available in your shell, run:
+
+```bash
+python backtest.py --symbols AMD,TSM,TSLA --days 365 --minimum-score 60
+```
+
+The backtester processes each historical bar in order and reports ending cash, return, trade count, and win rate. It is an analysis tool only and never submits orders.
+
+## Run tests
+
+```bash
+python -m unittest discover -s tests -v
+```
