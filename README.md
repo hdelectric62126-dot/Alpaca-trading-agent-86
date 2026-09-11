@@ -18,6 +18,10 @@ This starter project is intentionally locked to **Alpaca paper trading**.
 - Includes a walk-forward historical backtester for AMD, TSM, and TSLA.
 - Persists every paper analysis cycle and paper trade in a SQLite journal.
 - Provides 1-, 7-, and 30-day paper performance reports without placing orders.
+- Runs an advisory Performance Agent each trading day to study win rate, profit
+  factor, expectancy, drawdown, symbols, and signal-score ranges.
+- Stores each performance snapshot and prints plain-English recommendations;
+  it never changes trading rules or places orders.
 
 This is a test framework, not a guarantee of profit.
 
@@ -45,6 +49,8 @@ Recommended starter settings:
 - `MIN_SIGNAL_SCORE` = `60`
 - `SCOUT_TOP_N` = `3`
 - `JOURNAL_DB_PATH` = `/data/trading_journal.db`
+- `PERFORMANCE_DAYS` = `7`
+- `PERFORMANCE_MIN_TRADES` = `10`
 
 ## Railway persistent journal storage
 

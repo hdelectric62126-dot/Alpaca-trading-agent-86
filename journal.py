@@ -52,6 +52,11 @@ class TradeJournal:
                 entry_price REAL, exit_price REAL, realized_pnl REAL,
                 opened_at TEXT NOT NULL, closed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS performance_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, period_days INTEGER NOT NULL,
+                report TEXT NOT NULL, recommendations TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_cycles_timestamp ON analysis_cycles(timestamp);
             CREATE INDEX IF NOT EXISTS idx_trades_opened_at ON paper_trades(opened_at);
             """
@@ -130,6 +135,16 @@ class TradeJournal:
 
     def close(self):
         self.connection.close()
+
+    def record_performance_snapshot(self, *, period_days, report,
+                                    recommendations, timestamp=None):
+        self.connection.execute(
+            "INSERT INTO performance_snapshots "
+            "(timestamp, period_days, report, recommendations) VALUES (?, ?, ?, ?)",
+            (timestamp or utc_now(), int(period_days), json.dumps(report),
+             json.dumps(recommendations)),
+        )
+        self.connection.commit()
 
 
 def _value(value, name):

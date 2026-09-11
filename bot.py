@@ -15,6 +15,7 @@ from alpaca.data.enums import DataFeed
 from strategy import score_signal
 from scout import MarketScout
 from journal import PerformanceAnalyzer, TradeJournal
+from performance_agent import PerformanceAgent
 
 
 # ---------------------------
@@ -41,11 +42,14 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "10"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
+PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
+PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 journal = TradeJournal()
 scout = MarketScout(ENTRY_DIP_PCT, MIN_SIGNAL_SCORE, SCOUT_TOP_N)
+performance_agent = PerformanceAgent(journal, PERFORMANCE_MIN_TRADES)
 
 
 def market_is_open():
@@ -142,6 +146,7 @@ def daily_summary():
         f"wins={report['wins']} losses={report['losses']} "
         f"P/L=${report['total_profit_loss']:.2f} drawdown=${report['maximum_drawdown']:.2f}"
     )
+    PerformanceAgent.log_summary(performance_agent.analyze(PERFORMANCE_DAYS))
 
 
 def run():
