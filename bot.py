@@ -16,6 +16,7 @@ from strategy import score_signal
 from scout import MarketScout
 from journal import PerformanceAnalyzer, TradeJournal
 from performance_agent import PerformanceAgent
+from exit_agent import ExitAgent
 
 
 # ---------------------------
@@ -44,12 +45,16 @@ MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
+TRAILING_ARM_PCT = float(os.getenv("TRAILING_ARM_PCT", "0.35")) / 100.0
+TRAILING_GAP_PCT = float(os.getenv("TRAILING_GAP_PCT", "0.20")) / 100.0
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 journal = TradeJournal()
 scout = MarketScout(ENTRY_DIP_PCT, MIN_SIGNAL_SCORE, SCOUT_TOP_N)
 performance_agent = PerformanceAgent(journal, PERFORMANCE_MIN_TRADES)
+exit_agent = ExitAgent(TAKE_PROFIT_PCT, STOP_LOSS_PCT,
+                       TRAILING_ARM_PCT, TRAILING_GAP_PCT)
 
 
 def market_is_open():
@@ -215,9 +220,10 @@ def run():
                     entry = float(p.avg_entry_price)
                     qty = float(p.qty)
 
-                    if last_price >= entry * (1 + TAKE_PROFIT_PCT):
+                    exit_decision = exit_agent.decide(symbol, entry, bars)
+                    if exit_decision.action == "SELL":
                         if not has_open_order(symbol):
-                            order = submit_sell(symbol, qty, "take profit")
+                            order = submit_sell(symbol, qty, exit_decision.reason)
                             journal.record_cycle(
                                 symbol=symbol, current_price=last_price, market_data=bar_data(bars),
                                 signal=score_signal(bars, ENTRY_DIP_PCT), decision="SELL", order=order,
@@ -227,23 +233,12 @@ def run():
                             journal.close_trade(symbol=symbol, exit_price=last_price,
                                                 realized_pnl=(last_price - entry) * qty,
                                                 order_id=order.id)
-                    elif last_price <= entry * (1 - STOP_LOSS_PCT):
-                        if not has_open_order(symbol):
-                            order = submit_sell(symbol, qty, "stop loss")
-                            journal.record_cycle(
-                                symbol=symbol, current_price=last_price, market_data=bar_data(bars),
-                                signal=score_signal(bars, ENTRY_DIP_PCT), decision="SELL", order=order,
-                                quantity=qty, entry_price=entry, exit_price=last_price,
-                                realized_pnl=(last_price - entry) * qty,
-                            )
-                            journal.close_trade(symbol=symbol, exit_price=last_price,
-                                                realized_pnl=(last_price - entry) * qty,
-                                                order_id=order.id)
+                            exit_agent.clear(symbol)
                     else:
                         signal = score_signal(bars, ENTRY_DIP_PCT)
                         print(
-                            f"[HOLD] {symbol} last={last_price:.2f} entry={entry:.2f} "
-                            f"mean={mean_price:.2f}"
+                            f"[EXIT HOLD] {symbol} last={last_price:.2f} entry={entry:.2f} "
+                            f"P/L={exit_decision.pnl_pct * 100:.2f}% | {exit_decision.reason}"
                         )
                         journal.record_cycle(symbol=symbol, current_price=last_price,
                                              market_data=bar_data(bars), signal=signal, decision="HOLD",

@@ -22,6 +22,8 @@ This starter project is intentionally locked to **Alpaca paper trading**.
   factor, expectancy, drawdown, symbols, and signal-score ranges.
 - Stores each performance snapshot and prints plain-English recommendations;
   it never changes trading rules or places orders.
+- Uses an Exit Agent with an unchangeable hard stop, momentum-aware profit
+  taking, an extended profit target, and trailing profit protection.
 
 This is a test framework, not a guarantee of profit.
 
@@ -51,6 +53,8 @@ Recommended starter settings:
 - `JOURNAL_DB_PATH` = `/data/trading_journal.db`
 - `PERFORMANCE_DAYS` = `7`
 - `PERFORMANCE_MIN_TRADES` = `10`
+- `TRAILING_ARM_PCT` = `0.35`
+- `TRAILING_GAP_PCT` = `0.20`
 
 ## Railway persistent journal storage
 
