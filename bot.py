@@ -19,6 +19,7 @@ from journal import PerformanceAnalyzer, TradeJournal
 from performance_agent import PerformanceAgent
 from exit_agent import ExitAgent
 from risk_agent import RiskAgent
+from after_hours_agent import AfterHoursLearningAgent, ResearchCandidate
 
 
 # ---------------------------
@@ -51,6 +52,8 @@ TRAILING_ARM_PCT = float(os.getenv("TRAILING_ARM_PCT", "0.35")) / 100.0
 TRAILING_GAP_PCT = float(os.getenv("TRAILING_GAP_PCT", "0.20")) / 100.0
 MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+AFTER_HOURS_LOOKBACK_DAYS = int(os.getenv("AFTER_HOURS_LOOKBACK_DAYS", "180"))
+AFTER_HOURS_MIN_TEST_TRADES = int(os.getenv("AFTER_HOURS_MIN_TEST_TRADES", "3"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -66,6 +69,9 @@ risk_agent = RiskAgent(
     max_open_positions=MAX_OPEN_POSITIONS,
     daily_profit_target=DAILY_PROFIT_TARGET,
     daily_loss_limit=DAILY_LOSS_LIMIT,
+)
+after_hours_agent = AfterHoursLearningAgent(
+    minimum_test_trades=AFTER_HOURS_MIN_TEST_TRADES,
 )
 
 
@@ -127,6 +133,42 @@ def recent_bars(symbol):
     return bars
 
 
+def historical_hour_bars(symbol):
+    """Fetch closed-market research data; this function never places orders."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=AFTER_HOURS_LOOKBACK_DAYS)
+    req = StockBarsRequest(
+        symbol_or_symbols=[symbol], timeframe=TimeFrame.Hour,
+        start=start, end=end, feed=DataFeed.IEX,
+    )
+    bars = data.get_stock_bars(req).df
+    if bars.empty:
+        return None
+    if isinstance(bars.index, pd.MultiIndex):
+        try:
+            bars = bars.xs(symbol)
+        except Exception:
+            return None
+    return bars
+
+
+def run_after_hours_learning():
+    print("[AFTER HOURS] Market closed; starting knowledge-only historical research.")
+    bars_by_symbol = {}
+    for symbol in SYMBOLS:
+        bars = historical_hour_bars(symbol)
+        if bars is not None and not bars.empty:
+            bars_by_symbol[symbol] = bars
+    current = ResearchCandidate(
+        dip_threshold=ENTRY_DIP_PCT,
+        minimum_score=MIN_SIGNAL_SCORE,
+        take_profit=TAKE_PROFIT_PCT,
+        stop_loss=STOP_LOSS_PCT,
+    )
+    report = after_hours_agent.run(bars_by_symbol, current)
+    AfterHoursLearningAgent.log_summary(report)
+
+
 def submit_buy(symbol, price, notional):
     notional = min(MAX_TRADE_NOTIONAL, max(1.0, float(notional)))
     order = MarketOrderRequest(
@@ -177,11 +219,17 @@ def run():
     print(f"Symbols: {SYMBOLS}")
     print(f"Starting paper equity: ${start_equity:,.2f}")
     last_summary_date = None
+    last_after_hours_date = None
 
     while True:
         try:
             if not market_is_open():
-                print("[status] Market closed. Waiting...")
+                closed_date = datetime.now(timezone.utc).date()
+                if closed_date != last_after_hours_date:
+                    run_after_hours_learning()
+                    last_after_hours_date = closed_date
+                else:
+                    print("[status] Market closed. After-hours research already completed today.")
                 time.sleep(max(POLL_SECONDS, 60))
                 continue
 

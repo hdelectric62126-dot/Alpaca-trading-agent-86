@@ -27,6 +27,11 @@ This starter project is intentionally locked to **Alpaca paper trading**.
   taking, an extended profit target, and trailing profit protection.
 - Uses a Risk Agent to approve and size every new paper entry, cap total
   exposure, limit concurrent positions, and enforce daily guardrails.
+- Runs a knowledge-only After-Hours Learning Agent once per closed-market UTC
+  day. It compares bounded parameter variations on historical hourly bars using
+  a chronological 70/30 train/test split, saves its recommendation, and cannot
+  place orders or change the bot's settings. Daniel's approval is required
+  before any suggested rule change is applied.
 
 This is a test framework, not a guarantee of profit.
 
@@ -60,6 +65,9 @@ Recommended starter settings:
 - `TRAILING_GAP_PCT` = `0.20`
 - `MAX_TOTAL_EXPOSURE` = `75`
 - `MAX_OPEN_POSITIONS` = `3`
+- `AFTER_HOURS_LOOKBACK_DAYS` = `180`
+- `AFTER_HOURS_MIN_TEST_TRADES` = `3`
+- `AFTER_HOURS_REPORT_PATH` = `/data/after_hours_recommendations.json`
 
 ## Railway persistent journal storage
 
