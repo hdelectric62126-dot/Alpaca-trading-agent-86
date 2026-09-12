@@ -82,6 +82,11 @@ def account_equity():
     return float(acct.equity)
 
 
+def account_daily_pnl():
+    acct = trading.get_account()
+    return float(acct.equity) - float(acct.last_equity)
+
+
 def positions():
     return {p.symbol: p for p in trading.get_all_positions()}
 
@@ -180,8 +185,7 @@ def run():
                 time.sleep(max(POLL_SECONDS, 60))
                 continue
 
-            equity = account_equity()
-            pnl = equity - start_equity
+            pnl = account_daily_pnl()
 
             if pnl >= DAILY_PROFIT_TARGET:
                 print(f"[guard] Daily paper profit target reached: ${pnl:.2f}. No new entries.")

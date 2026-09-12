@@ -15,6 +15,7 @@ This starter project is intentionally locked to **Alpaca paper trading**.
 - Places a small paper market buy when the configured dip threshold is met.
 - Uses a configurable take-profit and stop-loss.
 - Stops opening new positions after the configured daily paper profit target or daily paper loss limit is reached.
+- Anchors daily profit and loss guardrails to Alpaca's prior-day closing equity, so Railway restarts cannot reset them.
 - Includes a walk-forward historical backtester for AMD, TSM, and TSLA.
 - Persists every paper analysis cycle and paper trade in a SQLite journal.
 - Provides 1-, 7-, and 30-day paper performance reports without placing orders.
@@ -67,6 +68,10 @@ Create a Railway Volume for the service and mount it at `/data`. Keep
 deploys and restarts. Without a mounted volume, the journal is ephemeral to
 the container. The journal contains paper-trading records only; never store
 Alpaca API keys in it or in the repository.
+
+Daily guardrails use Alpaca's `last_equity` as the prior-day closing baseline,
+so they remain anchored across Railway restarts instead of restarting from the
+process's equity when the container comes back up.
 
 ## Important
 
