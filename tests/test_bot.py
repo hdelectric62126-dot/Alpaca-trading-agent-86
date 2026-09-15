@@ -13,6 +13,10 @@ import bot
 
 
 class BotTests(unittest.TestCase):
+    def test_recent_bars_isolates_symbol_data_failures(self):
+        with patch.object(bot.data, "get_stock_bars", side_effect=RuntimeError("temporary outage")):
+            self.assertIsNone(bot.recent_bars("AMD"))
+
     def test_account_daily_pnl_uses_alpaca_last_equity(self):
         account = SimpleNamespace(equity="105.50", last_equity="100.00")
         with patch.object(bot.trading, "get_account", return_value=account):

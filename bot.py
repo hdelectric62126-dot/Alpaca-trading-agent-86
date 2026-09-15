@@ -77,7 +77,10 @@ after_hours_agent = AfterHoursLearningAgent(
 
 def market_is_open():
     try:
-        return bool(trading.get_clock().is_open)
+        clock = trading.get_clock()
+        if not clock.is_open:
+            print(f"[status] Market closed. next_open={clock.next_open}")
+        return bool(clock.is_open)
     except Exception as exc:
         print(f"[clock] {exc}")
         return False
@@ -116,7 +119,11 @@ def recent_bars(symbol):
         end=end,
         feed=DataFeed.IEX,
     )
-    bars = data.get_stock_bars(req).df
+    try:
+        bars = data.get_stock_bars(req).df
+    except Exception as exc:
+        print(f"[data] Failed to fetch bars for {symbol}: {type(exc).__name__}: {exc}")
+        return None
     if bars.empty:
         return None
 
@@ -218,6 +225,13 @@ def run():
     print("Paper agent started.")
     print(f"Symbols: {SYMBOLS}")
     print(f"Starting paper equity: ${start_equity:,.2f}")
+    print(
+        "Entry config: "
+        f"dip={ENTRY_DIP_PCT * 100:.2f}% "
+        f"min_score={MIN_SIGNAL_SCORE} top_n={SCOUT_TOP_N} "
+        f"max_positions={MAX_OPEN_POSITIONS} "
+        f"max_exposure=${MAX_TOTAL_EXPOSURE:.2f}"
+    )
     last_summary_date = None
     last_after_hours_date = None
 
@@ -269,6 +283,14 @@ def run():
                 for item in ranked[:5]
             ) or "no market data"
             print(f"[SCOUT] ranked={leaderboard} | * passed to execution agent")
+            eligible_count = sum(
+                item.entry_ready and item.signal.score >= MIN_SIGNAL_SCORE
+                for item in ranked
+            )
+            print(
+                f"[ENTRY CHECK] eligible={eligible_count} "
+                f"candidates={len(candidates)} positions={len(pos)}"
+            )
 
             for symbol in SYMBOLS:
                 bars = bars_by_symbol.get(symbol)
