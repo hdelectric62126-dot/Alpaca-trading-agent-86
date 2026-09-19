@@ -17,23 +17,46 @@ class ExitAgent:
 
     def __init__(self, take_profit_pct, stop_loss_pct,
                  trailing_arm_pct=0.35 / 100, trailing_gap_pct=0.20 / 100,
-                 extended_profit_multiple=1.5):
+                 extended_profit_multiple=1.5, connection=None):
         self.take_profit_pct = float(take_profit_pct)
         self.stop_loss_pct = float(stop_loss_pct)
         self.trailing_arm_pct = float(trailing_arm_pct)
         self.trailing_gap_pct = float(trailing_gap_pct)
         self.extended_profit_multiple = float(extended_profit_multiple)
         self.high_water = {}
+        self.entry_identity = {}
+        self.connection = connection
+        if connection is not None:
+            connection.execute("""CREATE TABLE IF NOT EXISTS exit_high_water (
+                symbol TEXT PRIMARY KEY, entry_identity TEXT NOT NULL,
+                peak REAL NOT NULL)""")
+            connection.commit()
+            for symbol, identity, peak in connection.execute(
+                    "SELECT symbol, entry_identity, peak FROM exit_high_water"):
+                self.high_water[symbol] = peak
+                self.entry_identity[symbol] = identity
 
     def clear(self, symbol):
         self.high_water.pop(symbol, None)
+        self.entry_identity.pop(symbol, None)
+        if self.connection is not None:
+            with self.connection:
+                self.connection.execute("DELETE FROM exit_high_water WHERE symbol=?", (symbol,))
 
-    def decide(self, symbol, entry_price, bars):
+    def decide(self, symbol, entry_price, bars, entry_identity=None):
         price = float(bars["close"].iloc[-1])
         entry = float(entry_price)
+        identity = repr((entry, str(entry_identity) if entry_identity is not None else None))
+        if self.entry_identity.get(symbol) != identity:
+            self.high_water.pop(symbol, None)
+        self.entry_identity[symbol] = identity
         pnl_pct = (price - entry) / entry
         peak = max(price, self.high_water.get(symbol, price))
         self.high_water[symbol] = peak
+        if self.connection is not None:
+            with self.connection:
+                self.connection.execute("""INSERT OR REPLACE INTO exit_high_water
+                    (symbol, entry_identity, peak) VALUES (?, ?, ?)""", (symbol, identity, peak))
         peak_gain_pct = (peak - entry) / entry
         pullback_pct = (peak - price) / peak
 

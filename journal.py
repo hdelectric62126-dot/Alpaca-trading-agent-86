@@ -63,6 +63,11 @@ class TradeJournal:
         )
         self.connection.commit()
 
+        columns = {row[1] for row in self.connection.execute('PRAGMA table_info(paper_trades)')}
+        if 'fill_verified' not in columns:
+            self.connection.execute('ALTER TABLE paper_trades ADD COLUMN fill_verified INTEGER NOT NULL DEFAULT 0')
+            self.connection.commit()
+
     def record_cycle(self, *, symbol, current_price, market_data, signal=None,
                      decision="HOLD", rejection_reason=None, order=None,
                      quantity=None, entry_price=None, exit_price=None,
@@ -107,8 +112,8 @@ class TradeJournal:
         self.connection.execute(
             """INSERT INTO paper_trades
             (symbol, score, order_id, status, quantity, entry_price, exit_price,
-             realized_pnl, opened_at, closed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             realized_pnl, opened_at, closed_at, fill_verified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
             (symbol, int(score), str(order_id) if order_id is not None else None,
              status, float(quantity), entry_price, exit_price, realized_pnl,
              opened_at or utc_now(), closed_at),
@@ -172,15 +177,19 @@ class PerformanceAnalyzer:
             (cutoff.isoformat(),),
         ).fetchall()
         trades = self.journal.connection.execute(
-            "SELECT * FROM paper_trades WHERE opened_at >= ? ORDER BY opened_at",
+            "SELECT * FROM paper_trades WHERE COALESCE(closed_at, opened_at) >= ? AND status != 'CONSUMED' ORDER BY COALESCE(closed_at, opened_at), id",
             (cutoff.isoformat(),),
         ).fetchall()
-        closed = [trade for trade in trades if trade["realized_pnl"] is not None]
+        legacy_count = sum(not trade['fill_verified'] for trade in trades)
+        trades = [trade for trade in trades if trade['fill_verified']]
+        closed = [trade for trade in trades if trade['status'] == 'CLOSED' and trade["realized_pnl"] is not None]
         profits = [float(trade["realized_pnl"]) for trade in closed]
         wins = [value for value in profits if value > 0]
         losses = [value for value in profits if value < 0]
         return {
             "days": int(days), "signals": len(cycles),
+            "legacy_estimated_trades_excluded": legacy_count,
+            "closed_trades": len(closed),
             "accepted_signals": sum(row["decision"] in ("BUY", "SELL") for row in cycles),
             "rejected_signals": sum(row["decision"] == "REJECT" for row in cycles),
             "paper_trades": len(trades), "wins": len(wins), "losses": len(losses),

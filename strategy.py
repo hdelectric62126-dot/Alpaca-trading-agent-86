@@ -24,7 +24,7 @@ def _rsi(closes: pd.Series, period: int = 14) -> float:
     if pd.isna(gains) or pd.isna(losses):
         return 50.0
     if losses == 0:
-        return 100.0
+        return 50.0 if gains == 0 else 100.0
     return float(100 - (100 / (1 + gains / losses)))
 
 
@@ -35,6 +35,12 @@ def score_signal(bars: pd.DataFrame, dip_threshold: float = 0.0035) -> Signal:
 
     closes = bars["close"].astype(float)
     volumes = bars["volume"].astype(float)
+    import numpy as np
+    prices = bars[['open', 'high', 'low', 'close']].astype(float)
+    if (not np.isfinite(prices.to_numpy()).all() or (prices <= 0).any().any()
+            or not np.isfinite(volumes.to_numpy()).all() or (volumes < 0).any()
+            or volumes.sum() <= 0):
+        raise ValueError('Bars must contain finite positive prices and usable volume')
     last_price = float(closes.iloc[-1])
     mean_price = float(closes.mean())
     dip_pct = (mean_price - last_price) / mean_price
@@ -111,33 +117,39 @@ def walk_forward_backtest(
     take_profit: float = 0.0045,
     stop_loss: float = 0.005,
     lookback: int = 30,
+    slippage_bps: float = 5.0,
 ) -> dict:
     """Simulate sequential entries and exits without using future bars."""
     cash = 1_000.0
     entry_price = None
     trades = []
+    if not 0 <= slippage_bps < 10000:
+        raise ValueError('slippage_bps must be between 0 and 10000')
+    cost = slippage_bps / 10000
     for index in range(lookback, len(bars)):
         window = bars.iloc[index - lookback:index]
         price = float(bars["close"].iloc[index])
         if entry_price is not None:
             if price >= entry_price * (1 + take_profit) or price <= entry_price * (1 - stop_loss):
-                change = (price / entry_price) - 1
+                change = (price * (1-cost) / entry_price) - 1
                 cash *= 1 + change
                 trades.append(change)
                 entry_price = None
             continue
         signal = score_signal(window, dip_threshold)
-        if signal.score >= minimum_score:
-            entry_price = price
+        if signal.score >= minimum_score and signal.dip_pct >= dip_threshold:
+            entry_price = float(bars['open'].iloc[index]) * (1+cost)
 
     if entry_price is not None:
-        change = (float(bars["close"].iloc[-1]) / entry_price) - 1
+        change = (float(bars["close"].iloc[-1]) * (1-cost) / entry_price) - 1
         cash *= 1 + change
         trades.append(change)
 
     wins = sum(change > 0 for change in trades)
     return {
         "starting_cash": 1000.0,
+        "slippage_bps_per_side": slippage_bps,
+        "simulation_scope": "single-symbol fixed exits; excludes portfolio limits and live trailing exits",
         "ending_cash": round(cash, 2),
         "return_pct": round((cash / 1000 - 1) * 100, 2),
         "trades": len(trades),

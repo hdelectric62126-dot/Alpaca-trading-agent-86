@@ -1,6 +1,7 @@
 """Hard, deterministic risk approval for new paper positions."""
 
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,12 @@ class RiskAgent:
         self.daily_loss_limit = float(daily_loss_limit)
 
     def assess(self, *, score, positions, daily_pnl, has_open_order=False):
+        values = [daily_pnl, score, self.max_trade_notional, self.max_total_exposure,
+                  self.daily_profit_target, self.daily_loss_limit]
+        if not all(math.isfinite(float(v)) for v in values):
+            return RiskDecision(False, 0.0, 'invalid risk inputs')
+        if any(not math.isfinite(float(getattr(p, 'market_value', float('nan')))) for p in positions.values()):
+            return RiskDecision(False, 0.0, 'invalid portfolio exposure')
         if daily_pnl >= self.daily_profit_target:
             return RiskDecision(False, 0.0, "daily profit target reached")
         if daily_pnl <= -self.daily_loss_limit:

@@ -1,19 +1,22 @@
 import os
 import time
 import math
-from types import SimpleNamespace
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 from strategy import score_signal
+from execution import PaperExecution
+from guardian_agent import GuardianAgent
+from market_data_agent import MarketDataAgent
 from scout import MarketScout
 from journal import PerformanceAnalyzer, TradeJournal
 from performance_agent import PerformanceAgent
@@ -52,16 +55,22 @@ TRAILING_ARM_PCT = float(os.getenv("TRAILING_ARM_PCT", "0.35")) / 100.0
 TRAILING_GAP_PCT = float(os.getenv("TRAILING_GAP_PCT", "0.20")) / 100.0
 MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+ENTRY_COOLDOWN_MINUTES = int(os.getenv("ENTRY_COOLDOWN_MINUTES", "30"))
+MAX_DAILY_ENTRIES = int(os.getenv("MAX_DAILY_ENTRIES", "6"))
+MAX_BAR_AGE_SECONDS = int(os.getenv("MAX_BAR_AGE_SECONDS", "180"))
 AFTER_HOURS_LOOKBACK_DAYS = int(os.getenv("AFTER_HOURS_LOOKBACK_DAYS", "180"))
 AFTER_HOURS_MIN_TEST_TRADES = int(os.getenv("AFTER_HOURS_MIN_TEST_TRADES", "3"))
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 journal = TradeJournal()
+execution = PaperExecution(trading, journal)
+guardian = GuardianAgent(journal.connection)
+market_data_agent = MarketDataAgent(data, lookback=LOOKBACK_MINUTES, max_age_seconds=MAX_BAR_AGE_SECONDS)
 scout = MarketScout(ENTRY_DIP_PCT, MIN_SIGNAL_SCORE, SCOUT_TOP_N)
 performance_agent = PerformanceAgent(journal, PERFORMANCE_MIN_TRADES)
 exit_agent = ExitAgent(TAKE_PROFIT_PCT, STOP_LOSS_PCT,
-                       TRAILING_ARM_PCT, TRAILING_GAP_PCT)
+                       TRAILING_ARM_PCT, TRAILING_GAP_PCT, connection=journal.connection)
 risk_agent = RiskAgent(
     minimum_score=MIN_SIGNAL_SCORE,
     max_trade_notional=MAX_TRADE_NOTIONAL,
@@ -73,17 +82,32 @@ risk_agent = RiskAgent(
 after_hours_agent = AfterHoursLearningAgent(
     minimum_test_trades=AFTER_HOURS_MIN_TEST_TRADES,
 )
+_clock_degraded = False
+_verified_open_until = None
 
 
 def market_is_open():
+    global _clock_degraded, _verified_open_until
     try:
         clock = trading.get_clock()
+        _clock_degraded = False
+        guardian.record_success('clock')
+        now = datetime.now(timezone.utc)
+        _verified_open_until = (min(clock.next_close, now + timedelta(seconds=90))
+                                if clock.is_open else None)
         if not clock.is_open:
             print(f"[status] Market closed. next_open={clock.next_open}")
         return bool(clock.is_open)
     except Exception as exc:
-        print(f"[clock] {exc}")
-        return False
+        _clock_degraded = True
+        guardian.record_failure('clock')
+        now = datetime.now(timezone.utc)
+        if _verified_open_until is not None and now < _verified_open_until:
+            print('[CLOCK] using recently verified session for exits only')
+            return True
+        # Never submit queued overnight orders or start research on unknown state.
+        print('[CLOCK] session unverified; orders and research paused')
+        return None
 
 
 def account_equity():
@@ -109,35 +133,11 @@ def has_open_order(symbol):
     return any(o.symbol == symbol for o in open_orders())
 
 
-def recent_bars(symbol):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=max(LOOKBACK_MINUTES * 3, 90))
-    req = StockBarsRequest(
-        symbol_or_symbols=[symbol],
-        timeframe=TimeFrame.Minute,
-        start=start,
-        end=end,
-        feed=DataFeed.IEX,
-    )
-    try:
-        bars = data.get_stock_bars(req).df
-    except Exception as exc:
-        print(f"[data] Failed to fetch bars for {symbol}: {type(exc).__name__}: {exc}")
-        return None
-    if bars.empty:
-        return None
-
-    # alpaca-py returns a multi-index dataframe when symbols are requested.
-    if isinstance(bars.index, pd.MultiIndex):
-        try:
-            bars = bars.xs(symbol)
-        except Exception:
-            return None
-
-    bars = bars.tail(LOOKBACK_MINUTES)
-    if len(bars) < max(10, LOOKBACK_MINUTES // 2):
-        return None
-    return bars
+def recent_bars(symbol, minimum_bars=None):
+    """Compatibility helper; the trading loop uses one watchlist-wide request."""
+    result = market_data_agent.fetch([symbol], held_symbols=[symbol] if minimum_bars == 2 else [],
+                                     now=datetime.now(timezone.utc))
+    return result.bars.get(symbol)
 
 
 def historical_hour_bars(symbol):
@@ -163,9 +163,12 @@ def run_after_hours_learning():
     print("[AFTER HOURS] Market closed; starting knowledge-only historical research.")
     bars_by_symbol = {}
     for symbol in SYMBOLS:
-        bars = historical_hour_bars(symbol)
-        if bars is not None and not bars.empty:
-            bars_by_symbol[symbol] = bars
+        try:
+            bars = historical_hour_bars(symbol)
+            if bars is not None and not bars.empty:
+                bars_by_symbol[symbol] = bars
+        except Exception as exc:
+            print(f'[RESEARCH DATA] {symbol}: {type(exc).__name__}; other symbols continue')
     current = ResearchCandidate(
         dip_threshold=ENTRY_DIP_PCT,
         minimum_score=MIN_SIGNAL_SCORE,
@@ -176,32 +179,22 @@ def run_after_hours_learning():
     AfterHoursLearningAgent.log_summary(report)
 
 
-def submit_buy(symbol, price, notional):
-    notional = min(MAX_TRADE_NOTIONAL, max(1.0, float(notional)))
-    order = MarketOrderRequest(
-        symbol=symbol,
-        notional=round(notional, 2),
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,
-    )
-    result = trading.submit_order(order_data=order)
-    print(f"[PAPER BUY] {symbol} approx ${notional:.2f} near {price:.2f} | order={result.id}")
-    return result, notional
+def submit_buy(symbol, price, notional, score=0):
+    notional = float(notional)
+    if not math.isfinite(notional) or not 1 <= notional <= MAX_TRADE_NOTIONAL:
+        raise ValueError('Buy notional is outside configured limits')
+    order = execution.submit(symbol, 'buy', score=score, notional=round(notional, 2))
+    print(f"[PAPER BUY SUBMITTED] {symbol} ${notional:.2f} order={order.id}")
+    return order, notional
 
 
-def submit_sell(symbol, qty, reason):
+def submit_sell(symbol, qty, reason, entry_price):
     qty = float(qty)
-    if qty <= 0:
-        return
-    order = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY,
-    )
-    result = trading.submit_order(order_data=order)
-    print(f"[PAPER SELL] {symbol} qty={qty} reason={reason} | order={result.id}")
-    return result
+    if not math.isfinite(qty) or qty <= 0:
+        raise ValueError('Sell quantity must be finite and positive')
+    order = execution.submit(symbol, 'sell', quantity=qty, entry_price=entry_price)
+    print(f"[PAPER SELL SUBMITTED] {symbol} qty={qty} reason={reason} order={order.id}")
+    return order
 
 
 def bar_data(bars):
@@ -220,168 +213,147 @@ def daily_summary():
     PerformanceAgent.log_summary(performance_agent.analyze(PERFORMANCE_DAYS))
 
 
-def run():
-    start_equity = account_equity()
-    print("Paper agent started.")
-    print(f"Symbols: {SYMBOLS}")
-    print(f"Starting paper equity: ${start_equity:,.2f}")
-    print(
-        "Entry config: "
-        f"dip={ENTRY_DIP_PCT * 100:.2f}% "
-        f"min_score={MIN_SIGNAL_SCORE} top_n={SCOUT_TOP_N} "
-        f"max_positions={MAX_OPEN_POSITIONS} "
-        f"max_exposure=${MAX_TOTAL_EXPOSURE:.2f}"
-    )
-    last_summary_date = None
-    last_after_hours_date = None
+def manage_positions(pos, bars_by_symbol, orders):
+    pending_symbols = {row['symbol'] for row in execution.pending()}
+    healthy = True
+    for symbol, position in pos.items():
+        try:
+            bars = bars_by_symbol.get(symbol)
+            if bars is None:
+                healthy = False
+                print(f"[EXIT DATA] {symbol}: no fresh completed bars; exit decision unavailable")
+                continue
+            if symbol in pending_symbols or any(o.symbol == symbol for o in orders):
+                continue
+            entry, qty = float(position.avg_entry_price), float(position.qty)
+            if not math.isfinite(entry) or entry <= 0 or not math.isfinite(qty) or qty <= 0:
+                healthy = False
+                print(f"[EXIT] {symbol}: invalid or unsupported position requires review")
+                continue
+            tracked = journal.connection.execute(
+                "SELECT order_id FROM paper_trades WHERE symbol=? AND status='OPEN' AND fill_verified=1 ORDER BY id DESC LIMIT 1",
+                (symbol,)).fetchone()
+            identity = tracked['order_id'] if tracked else 'broker-existing'
+            decision = exit_agent.decide(symbol, entry, bars, entry_identity=identity)
+            if decision.action == 'SELL':
+                order = submit_sell(symbol, qty, decision.reason, entry)
+                journal.record_cycle(symbol=symbol, current_price=float(bars['close'].iloc[-1]),
+                                     market_data=bar_data(bars), decision='SELL', order=order)
+            else:
+                price = float(bars['close'].iloc[-1])
+                journal.record_cycle(symbol=symbol, current_price=price, market_data=bar_data(bars),
+                                     signal=score_signal(bars, ENTRY_DIP_PCT), decision='HOLD',
+                                     quantity=qty, entry_price=entry, unrealized_pnl=(price-entry)*qty)
+        except Exception as exc:
+            healthy = False
+            print(f"[EXIT] {symbol}: {type(exc).__name__}: {exc}")
+    if healthy:
+        guardian.record_success('exit_management')
+    else:
+        guardian.record_failure('exit_management')
+    return healthy
 
+
+def run_cycle():
+    # Reconcile even while closed, so late fills and cancellations are recorded.
+    reconciled = execution.reconcile()
+    if reconciled:
+        guardian.record_success('reconciliation')
+    else:
+        guardian.record_failure('reconciliation')
+    market_state = market_is_open()
+    if market_state is not True:
+        return market_state
+    pos = positions()
+    orders = open_orders()
+    snapshot = market_data_agent.fetch([*pos, *SYMBOLS], held_symbols=pos)
+    bars_by_symbol = snapshot.bars
+    if snapshot.transport_ok:
+        guardian.record_success('market_data')
+    else:
+        guardian.record_failure('market_data')
+    print(f'[DATA AGENT] ready={len(snapshot.bars)} rejected={len(snapshot.rejected)} '
+          f'requests={snapshot.request_count} elapsed={snapshot.elapsed_seconds:.3f}s')
+    for symbol, reason in snapshot.rejected.items():
+        print(f'[DATA QUALITY] {symbol}: {reason}')
+    # Daily limits and entry failures must never bypass position protection.
+    exits_healthy = manage_positions(pos, bars_by_symbol, orders)
+    if _clock_degraded or not guardian.entry_allowed() or not exits_healthy:
+        print('[GUARDIAN] entries paused; exit management remains active')
+        return True
+    pnl = account_daily_pnl()
+    if not reconciled or execution.pending():
+        print('[ENTRY GUARD] unresolved orders; entries paused')
+        return True
+    if pnl >= DAILY_PROFIT_TARGET or pnl <= -DAILY_LOSS_LIMIT:
+        print(f'[ENTRY GUARD] daily limit reached: ${pnl:.2f}; exits remain active')
+        return True
+    if not math.isfinite(pnl):
+        print('[ENTRY GUARD] invalid daily P/L')
+        return True
+    # Re-read after exits; include all broker pending orders in exposure gating.
+    pos, orders = positions(), open_orders()
+    if orders:
+        print('[ENTRY GUARD] broker has pending orders; entries paused')
+        return True
+    for symbol in list(exit_agent.high_water):
+        if symbol not in pos:
+            exit_agent.clear(symbol)
+    ranked = scout.rank({s: b for s, b in bars_by_symbol.items() if s in SYMBOLS and s not in pos})
+    candidates = scout.candidates(ranked)
+    selected = {item.symbol for item in candidates}
+    for item in ranked:
+        if item.symbol not in selected:
+            journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                 market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                 decision='REJECT', rejection_reason='dip, score, or top-ranked selection not met')
+    print('[SCOUT] ' + ', '.join(f'{item.symbol}:{item.signal.score}' for item in ranked[:5]))
+    # Execute in rank order, rather than watchlist order.
+    for item in candidates:
+        block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
+                                      daily_entries=MAX_DAILY_ENTRIES)
+        risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl)
+        if block or not risk.approved:
+            journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                 market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                 decision='REJECT', rejection_reason=block or risk.reason)
+            continue
+        order, notional = submit_buy(item.symbol, item.price, risk.notional, item.signal.score)
+        journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                             market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                             decision='BUY', order=order)
+        # Refresh on next scan rather than assuming a submitted order has filled.
+        break
+    return True
+
+
+def run():
+    print(f'Paper agent started. Symbols: {SYMBOLS}')
+    print(f'Starting paper equity: ${account_equity():,.2f}')
+    print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
+    print('[AGENT TEAM] Scout, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    last_summary_date = last_after_hours_date = None
     while True:
         try:
-            if not market_is_open():
-                closed_date = datetime.now(timezone.utc).date()
-                if closed_date != last_after_hours_date:
-                    run_after_hours_learning()
-                    last_after_hours_date = closed_date
-                else:
-                    print("[status] Market closed. After-hours research already completed today.")
-                time.sleep(max(POLL_SECONDS, 60))
-                continue
-
-            pnl = account_daily_pnl()
-
-            if pnl >= DAILY_PROFIT_TARGET:
-                print(f"[guard] Daily paper profit target reached: ${pnl:.2f}. No new entries.")
-                time.sleep(POLL_SECONDS)
-                continue
-
-            if pnl <= -DAILY_LOSS_LIMIT:
-                print(f"[guard] Daily paper loss limit reached: ${pnl:.2f}. No new entries.")
-                time.sleep(POLL_SECONDS)
-                continue
-
+            opened = run_cycle()
+            guardian.record_success('runtime')
+            guardian.write_status(Path(journal.path).with_name('guardian_status.json'))
             current_date = datetime.now(timezone.utc).date()
-            if current_date != last_summary_date:
+            if opened and current_date != last_summary_date:
                 daily_summary()
                 last_summary_date = current_date
-
-            pos = positions()
-
-            # Agent #2: collect and rank the entire watchlist before Agent #1
-            # is allowed to consider a new entry.
-            bars_by_symbol = {}
-            for symbol in SYMBOLS:
-                bars = recent_bars(symbol)
-                if bars is None or bars.empty:
-                    print(f"[data] Not enough bars for {symbol}")
-                else:
-                    bars_by_symbol[symbol] = bars
-
-            ranked = scout.rank(bars_by_symbol)
-            candidates = {item.symbol for item in scout.candidates(ranked)}
-            leaderboard = ", ".join(
-                f"{item.symbol}:{item.signal.score}{'*' if item.symbol in candidates else ''}"
-                for item in ranked[:5]
-            ) or "no market data"
-            print(f"[SCOUT] ranked={leaderboard} | * passed to execution agent")
-            eligible_count = sum(
-                item.entry_ready and item.signal.score >= MIN_SIGNAL_SCORE
-                for item in ranked
-            )
-            print(
-                f"[ENTRY CHECK] eligible={eligible_count} "
-                f"candidates={len(candidates)} positions={len(pos)}"
-            )
-
-            for symbol in SYMBOLS:
-                bars = bars_by_symbol.get(symbol)
-                if bars is None:
-                    continue
-
-                last_price = float(bars["close"].iloc[-1])
-                mean_price = float(bars["close"].mean())
-
-                # Manage an existing position first.
-                if symbol in pos:
-                    p = pos[symbol]
-                    entry = float(p.avg_entry_price)
-                    qty = float(p.qty)
-
-                    exit_decision = exit_agent.decide(symbol, entry, bars)
-                    if exit_decision.action == "SELL":
-                        if not has_open_order(symbol):
-                            order = submit_sell(symbol, qty, exit_decision.reason)
-                            journal.record_cycle(
-                                symbol=symbol, current_price=last_price, market_data=bar_data(bars),
-                                signal=score_signal(bars, ENTRY_DIP_PCT), decision="SELL", order=order,
-                                quantity=qty, entry_price=entry, exit_price=last_price,
-                                realized_pnl=(last_price - entry) * qty,
-                            )
-                            journal.close_trade(symbol=symbol, exit_price=last_price,
-                                                realized_pnl=(last_price - entry) * qty,
-                                                order_id=order.id)
-                            exit_agent.clear(symbol)
-                    else:
-                        signal = score_signal(bars, ENTRY_DIP_PCT)
-                        print(
-                            f"[EXIT HOLD] {symbol} last={last_price:.2f} entry={entry:.2f} "
-                            f"P/L={exit_decision.pnl_pct * 100:.2f}% | {exit_decision.reason}"
-                        )
-                        journal.record_cycle(symbol=symbol, current_price=last_price,
-                                             market_data=bar_data(bars), signal=signal, decision="HOLD",
-                                             quantity=qty, entry_price=entry,
-                                             unrealized_pnl=(last_price - entry) * qty)
-                    continue
-
-                # One simple mean-reversion entry:
-                # buy when last price is ENTRY_DIP_PCT below the rolling mean.
-                threshold = mean_price * (1 - ENTRY_DIP_PCT)
-                signal = score_signal(bars, ENTRY_DIP_PCT)
-                print(f"[SIGNAL] {symbol} score={signal.score}/100 | " + "; ".join(signal.reasons))
-                order_exists = has_open_order(symbol)
-                risk = risk_agent.assess(
-                    score=signal.score, positions=pos, daily_pnl=pnl,
-                    has_open_order=order_exists,
-                )
-                if symbol in candidates and risk.approved:
-                    order, notional = submit_buy(symbol, last_price, risk.notional)
-                    quantity = notional / last_price
-                    journal.record_cycle(symbol=symbol, current_price=last_price,
-                                         market_data=bar_data(bars), signal=signal, decision="BUY",
-                                         order=order, quantity=quantity, entry_price=last_price)
-                    journal.record_trade(symbol=symbol, score=signal.score, quantity=quantity,
-                                         entry_price=last_price, order_id=order.id, status="OPEN")
-                    # Reserve this exposure immediately for later symbols in the
-                    # same scan instead of waiting for Alpaca's next refresh.
-                    pos[symbol] = SimpleNamespace(market_value=notional)
-                else:
-                    rejection_reason = []
-                    if last_price > threshold:
-                        rejection_reason.append("price is not below the dip threshold")
-                    if signal.score < MIN_SIGNAL_SCORE:
-                        rejection_reason.append(f"score {signal.score} is below minimum {MIN_SIGNAL_SCORE}")
-                    if last_price <= threshold and signal.score >= MIN_SIGNAL_SCORE and symbol not in candidates:
-                        rejection_reason.append(f"not in scout's top {SCOUT_TOP_N} opportunities")
-                    if not risk.approved:
-                        rejection_reason.append("risk agent: " + risk.reason)
-                    rejection_reason = "; ".join(rejection_reason)
-                    print(
-                        f"[WAIT] {symbol} last={last_price:.2f} "
-                        f"mean={mean_price:.2f} trigger<={threshold:.2f} "
-                        f"score>={MIN_SIGNAL_SCORE}"
-                    )
-                    journal.record_cycle(symbol=symbol, current_price=last_price,
-                                         market_data=bar_data(bars), signal=signal, decision="REJECT",
-                                         rejection_reason=rejection_reason)
-
-            time.sleep(POLL_SECONDS)
-
+            if opened is False and current_date != last_after_hours_date:
+                run_after_hours_learning()
+                last_after_hours_date = current_date
+            time.sleep(max(POLL_SECONDS, 1))
         except KeyboardInterrupt:
-            print("Stopped.")
+            print('Stopped.')
             break
         except Exception as exc:
-            print(f"[error] {type(exc).__name__}: {exc}")
+            guardian.record_failure('runtime')
+            print(f'[error] {type(exc).__name__}: {exc}')
             time.sleep(max(POLL_SECONDS, 30))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run()

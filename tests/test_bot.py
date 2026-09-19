@@ -28,6 +28,7 @@ class BotTests(unittest.TestCase):
                 patch.object(bot, "market_is_open", return_value=True), \
                 patch.object(bot, "daily_summary"), \
                 patch.object(bot, "positions", return_value={}), \
+                patch.object(bot, "open_orders", return_value=[]), \
                 patch.object(bot.time, "sleep", side_effect=KeyboardInterrupt), \
                 patch.object(bot, "SYMBOLS", []):
             bot.run()
