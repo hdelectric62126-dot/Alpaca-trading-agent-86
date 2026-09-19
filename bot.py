@@ -17,6 +17,8 @@ from strategy import score_signal
 from execution import PaperExecution
 from guardian_agent import GuardianAgent
 from market_data_agent import MarketDataAgent
+from dashboard_feed import start_dashboard_feed
+from dashboard_runtime import publish_runtime
 from scout import MarketScout
 from journal import PerformanceAnalyzer, TradeJournal
 from performance_agent import PerformanceAgent
@@ -90,6 +92,9 @@ def market_is_open():
     global _clock_degraded, _verified_open_until
     try:
         clock = trading.get_clock()
+        publish_runtime(journal.path, market=dict(is_open=bool(clock.is_open),
+                        next_open=clock.next_open.isoformat(), next_close=clock.next_close.isoformat(),
+                        observed_at=datetime.now(timezone.utc).isoformat()))
         _clock_degraded = False
         guardian.record_success('clock')
         now = datetime.now(timezone.utc)
@@ -112,16 +117,27 @@ def market_is_open():
 
 def account_equity():
     acct = trading.get_account()
+    publish_runtime(journal.path, account=dict(equity=float(acct.equity),
+                    last_equity=float(acct.last_equity),
+                    observed_at=datetime.now(timezone.utc).isoformat()))
     return float(acct.equity)
 
 
 def account_daily_pnl():
     acct = trading.get_account()
+    publish_runtime(journal.path, account=dict(equity=float(acct.equity),
+                    last_equity=float(acct.last_equity),
+                    observed_at=datetime.now(timezone.utc).isoformat()))
     return float(acct.equity) - float(acct.last_equity)
 
 
 def positions():
-    return {p.symbol: p for p in trading.get_all_positions()}
+    current = {p.symbol: p for p in trading.get_all_positions()}
+    publish_runtime(journal.path, positions=[dict(symbol=p.symbol,quantity=float(p.qty),
+                    entry_price=float(p.avg_entry_price),market_value=float(p.market_value),
+                    unrealized_pnl=float(p.unrealized_pl)) for p in current.values()],
+                    positions_observed_at=datetime.now(timezone.utc).isoformat())
+    return current
 
 
 def open_orders():
@@ -328,6 +344,10 @@ def run_cycle():
 
 
 def run():
+    try:
+        start_dashboard_feed(journal.path)
+    except OSError:
+        print('[DASHBOARD] feed unavailable; trading loop continues')
     print(f'Paper agent started. Symbols: {SYMBOLS}')
     print(f'Starting paper equity: ${account_equity():,.2f}')
     print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
@@ -336,6 +356,10 @@ def run():
     while True:
         try:
             opened = run_cycle()
+            publish_runtime(journal.path, phase='market_open' if opened is True else ('market_closed' if opened is False else 'clock_unavailable'))
+            if opened is False:
+                account_equity()
+                positions()
             guardian.record_success('runtime')
             guardian.write_status(Path(journal.path).with_name('guardian_status.json'))
             current_date = datetime.now(timezone.utc).date()
@@ -343,7 +367,9 @@ def run():
                 daily_summary()
                 last_summary_date = current_date
             if opened is False and current_date != last_after_hours_date:
+                publish_runtime(journal.path, phase='research')
                 run_after_hours_learning()
+                publish_runtime(journal.path, phase='market_closed')
                 last_after_hours_date = current_date
             time.sleep(max(POLL_SECONDS, 1))
         except KeyboardInterrupt:
