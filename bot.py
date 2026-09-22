@@ -25,6 +25,7 @@ from performance_agent import PerformanceAgent
 from exit_agent import ExitAgent
 from risk_agent import RiskAgent
 from after_hours_agent import AfterHoursLearningAgent, ResearchCandidate
+from paper_tuning import resolve_paper_sizing
 
 
 # ---------------------------
@@ -57,6 +58,16 @@ TRAILING_ARM_PCT = float(os.getenv("TRAILING_ARM_PCT", "0.35")) / 100.0
 TRAILING_GAP_PCT = float(os.getenv("TRAILING_GAP_PCT", "0.20")) / 100.0
 MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+PAPER_TUNING_PROFILE = os.getenv("PAPER_TUNING_PROFILE", "baseline").strip().lower()
+_sizing = resolve_paper_sizing(
+    PAPER_TUNING_PROFILE,
+    max_trade_notional=MAX_TRADE_NOTIONAL,
+    max_total_exposure=MAX_TOTAL_EXPOSURE,
+    max_open_positions=MAX_OPEN_POSITIONS,
+)
+MAX_TRADE_NOTIONAL = _sizing.max_trade_notional
+MAX_TOTAL_EXPOSURE = _sizing.max_total_exposure
+MAX_OPEN_POSITIONS = _sizing.max_open_positions
 ENTRY_COOLDOWN_MINUTES = int(os.getenv("ENTRY_COOLDOWN_MINUTES", "30"))
 MAX_DAILY_ENTRIES = int(os.getenv("MAX_DAILY_ENTRIES", "6"))
 MAX_BAR_AGE_SECONDS = int(os.getenv("MAX_BAR_AGE_SECONDS", "180"))
@@ -351,6 +362,7 @@ def run():
     print(f'Paper agent started. Symbols: {SYMBOLS}')
     print(f'Starting paper equity: ${account_equity():,.2f}')
     print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
+    print(f'Paper sizing profile: {PAPER_TUNING_PROFILE}; trade_cap=${MAX_TRADE_NOTIONAL:.2f}; exposure_cap=${MAX_TOTAL_EXPOSURE:.2f}; max_positions={MAX_OPEN_POSITIONS}')
     print('[AGENT TEAM] Scout, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
