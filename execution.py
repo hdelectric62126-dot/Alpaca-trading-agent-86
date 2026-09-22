@@ -132,9 +132,11 @@ class PaperExecution:
         if completed > now + timedelta(minutes=1) or completed < datetime.fromisoformat(row['created_at']) - timedelta(seconds=5):
             raise ValueError('Broker timestamp is outside intent lifetime')
         completed = completed.isoformat()
+        realized_pnl = None
         with self.db:
             if qty > 0:
                 if row['side'] == 'buy':
+                    realized_pnl = (price-entry)*qty
                     self.db.execute('''INSERT INTO paper_trades
                         (symbol,score,order_id,status,quantity,entry_price,opened_at,fill_verified)
                         VALUES (?,?,?,'OPEN',?,?,?,1)''',
@@ -161,11 +163,16 @@ class PaperExecution:
                         (symbol,score,order_id,status,quantity,entry_price,exit_price,realized_pnl,opened_at,closed_at,fill_verified)
                         VALUES (?,?,?,'CLOSED',?,?,?,?,?,?,1)''',
                         (row['symbol'], trade['score'] if trade else 0, str(order.id), qty,
-                         entry, price, (price-entry)*qty,
+                         entry, price, realized_pnl,
                          trade['opened_at'] if trade else row['created_at'], completed))
             self.db.execute('''UPDATE order_intents SET status=?, order_id=?, filled_qty=?,
                             filled_price=?, completed_at=? WHERE client_id=?''',
                             (status, str(order.id), qty, price or None, completed, client_id))
+        if qty > 0:
+            if row['side'] == 'buy':
+                print(f"[FILL VERIFIED] BUY {row['symbol']} qty={qty:.9f} price={price:.4f} broker_status={status}")
+            else:
+                print(f"[FILL VERIFIED] SELL {row['symbol']} qty={qty:.9f} price={price:.4f} realized_pnl=${realized_pnl:.4f} broker_status={status}")
 
     def entry_block(self, symbol, now=None, cooldown_minutes=30, daily_entries=6):
         now = now or datetime.now(timezone.utc)
