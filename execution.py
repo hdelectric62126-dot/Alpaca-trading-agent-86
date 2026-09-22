@@ -136,7 +136,6 @@ class PaperExecution:
         with self.db:
             if qty > 0:
                 if row['side'] == 'buy':
-                    realized_pnl = (price-entry)*qty
                     self.db.execute('''INSERT INTO paper_trades
                         (symbol,score,order_id,status,quantity,entry_price,opened_at,fill_verified)
                         VALUES (?,?,?,'OPEN',?,?,?,1)''',
@@ -159,6 +158,7 @@ class PaperExecution:
                         to_consume -= consumed
                         if to_consume <= 1e-8:
                             break
+                    realized_pnl = (price-entry)*qty
                     self.db.execute('''INSERT INTO paper_trades
                         (symbol,score,order_id,status,quantity,entry_price,exit_price,realized_pnl,opened_at,closed_at,fill_verified)
                         VALUES (?,?,?,'CLOSED',?,?,?,?,?,?,1)''',
