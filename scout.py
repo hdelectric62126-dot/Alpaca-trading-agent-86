@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from strategy import Signal, score_signal
+from strategy import Signal, entry_reversal_confirmed, score_signal
 
 
 @dataclass(frozen=True)
@@ -13,11 +13,13 @@ class Opportunity:
     price: float
     mean_price: float
     trigger_price: float
+    short_mean_price: float
+    reversal_confirmed: bool
     signal: Signal
 
     @property
     def entry_ready(self) -> bool:
-        return self.price <= self.trigger_price
+        return self.price <= self.trigger_price and self.reversal_confirmed
 
 
 class MarketScout:
@@ -34,12 +36,15 @@ class MarketScout:
         closes = bars["close"].astype(float)
         price = float(closes.iloc[-1])
         mean_price = float(closes.mean())
+        short_mean_price = float(closes.tail(min(5, len(closes))).mean())
         signal = score_signal(bars, self.dip_threshold)
         return Opportunity(
             symbol=symbol,
             price=price,
             mean_price=mean_price,
             trigger_price=mean_price * (1 - self.dip_threshold),
+            short_mean_price=short_mean_price,
+            reversal_confirmed=entry_reversal_confirmed(bars),
             signal=signal,
         )
 
