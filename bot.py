@@ -331,10 +331,20 @@ def run_cycle():
     selected = {item.symbol for item in candidates}
     for item in ranked:
         if item.symbol not in selected:
+            if item.price > item.trigger_price:
+                reason = 'dip threshold not met'
+            elif not item.reversal_confirmed:
+                reason = 'dip still falling; reversal not confirmed'
+            elif item.signal.score < MIN_SIGNAL_SCORE:
+                reason = 'signal score below minimum'
+            else:
+                reason = 'eligible setup outside scout top selection'
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
-                                 decision='REJECT', rejection_reason='dip, score, or top-ranked selection not met')
-    print('[SCOUT] ' + ', '.join(f'{item.symbol}:{item.signal.score}' for item in ranked[:5]))
+                                 decision='REJECT', rejection_reason=reason)
+    print('[SCOUT] ' + ', '.join(
+        f"{item.symbol}:{item.signal.score}:{'READY' if item.entry_ready else 'WAIT'}"
+        for item in ranked[:5]))
     # Execute in rank order, rather than watchlist order.
     for item in candidates:
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
