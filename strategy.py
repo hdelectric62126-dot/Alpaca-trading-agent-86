@@ -28,6 +28,24 @@ def _rsi(closes: pd.Series, period: int = 14) -> float:
     return float(100 - (100 / (1 + gains / losses)))
 
 
+def entry_reversal_confirmed(bars: pd.DataFrame, short_window: int = 5) -> bool:
+    """Require a depressed setup to turn upward before entry.
+
+    The latest completed close must be above the prior close and above the
+    short rolling close average. This blocks buying while a dip is still
+    actively falling, while still requiring the separate broader dip gate.
+    """
+    if short_window < 2:
+        raise ValueError("short_window must be at least 2")
+    if len(bars) < 2:
+        return False
+    closes = bars["close"].astype(float)
+    latest = float(closes.iloc[-1])
+    previous = float(closes.iloc[-2])
+    short_mean = float(closes.tail(min(short_window, len(closes))).mean())
+    return latest > previous and latest > short_mean
+
+
 def score_signal(bars: pd.DataFrame, dip_threshold: float = 0.0035) -> Signal:
     """Score the latest bar using only the supplied historical bars."""
     if len(bars) < 2:
@@ -137,7 +155,8 @@ def walk_forward_backtest(
                 entry_price = None
             continue
         signal = score_signal(window, dip_threshold)
-        if signal.score >= minimum_score and signal.dip_pct >= dip_threshold:
+        if (signal.score >= minimum_score and signal.dip_pct >= dip_threshold
+                and entry_reversal_confirmed(window)):
             entry_price = float(bars['open'].iloc[index]) * (1+cost)
 
     if entry_price is not None:
