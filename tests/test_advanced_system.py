@@ -7,6 +7,7 @@ import pandas as pd
 from advanced_system import (
     AdvancedDecisionEngine,
     AdvancedFeatureStore,
+    AdvancedOpportunityRouter,
     ChampionChallengerLab,
     MarketRegimeClassifier,
     PortfolioRiskModel,
@@ -133,6 +134,34 @@ class AdvancedSystemTests(unittest.TestCase):
         self.assertEqual(result["sample"], 24)
         self.assertIsNotNone(result["probability"])
         self.assertGreater(result["probability"], 0.5)
+
+    def test_router_can_nominate_non_dip_momentum_or_breakout(self):
+        regime = MarketRegimeClassifier().classify(
+            {"SPY": bars(), "QQQ": bars(start=200)}
+        )
+        signal = NS(
+            score=80,
+            dip_pct=-0.001,
+            rsi=60,
+            momentum_pct=0.003,
+            volume_ratio=1.5,
+            price_vs_vwap_pct=0.002,
+        )
+        item = NS(
+            symbol="AMD",
+            price=float(bars()["close"].iloc[-1]),
+            signal=signal,
+            entry_ready=False,
+            reversal_confirmed=False,
+        )
+        routed = AdvancedOpportunityRouter(
+            minimum_signal_score=60,
+            minimum_strategy_score=65,
+            top_n=3,
+        ).route([item], {"AMD": bars()}, regime)
+        self.assertEqual(len(routed), 1)
+        self.assertIn(routed[0].strategy, {"momentum", "breakout", "trend_following"})
+        self.assertFalse(item.entry_ready)
 
     def test_portfolio_model_blocks_high_correlation(self):
         candidate = bars()
