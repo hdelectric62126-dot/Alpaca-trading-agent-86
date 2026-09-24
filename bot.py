@@ -28,6 +28,7 @@ from after_hours_agent import AfterHoursLearningAgent, ResearchCandidate
 from paper_tuning import resolve_paper_sizing
 from trade_gate import assess_market_regime, build_technical_plan
 from research_gate import ResearchGate
+from decision_intelligence import DecisionIntelligenceAgent
 
 
 # ---------------------------
@@ -61,6 +62,12 @@ MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "2.0")) / 100.0
 RESEARCH_GATE_ENABLED = os.getenv("RESEARCH_GATE_ENABLED", "true").lower() == "true"
 NEWS_LOOKBACK_MINUTES = int(os.getenv("NEWS_LOOKBACK_MINUTES", "120"))
 RESEARCH_CACHE_SECONDS = int(os.getenv("RESEARCH_CACHE_SECONDS", "300"))
+INTELLIGENCE_GATE_ENABLED = os.getenv("INTELLIGENCE_GATE_ENABLED", "true").lower() == "true"
+INTELLIGENCE_CACHE_SECONDS = int(os.getenv("INTELLIGENCE_CACHE_SECONDS", "900"))
+SCREEN_MAX_PE = float(os.getenv("SCREEN_MAX_PE", "20"))
+SCREEN_MIN_REVENUE_GROWTH_PCT = float(os.getenv("SCREEN_MIN_REVENUE_GROWTH_PCT", "8"))
+FUNDAMENTAL_GATE_STRICT = os.getenv("FUNDAMENTAL_GATE_STRICT", "false").lower() == "true"
+MAX_DAILY_CHASE_PCT = float(os.getenv("MAX_DAILY_CHASE_PCT", "2.5")) / 100.0
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -111,6 +118,14 @@ research_gate = ResearchGate(
     SECRET_KEY,
     news_lookback_minutes=NEWS_LOOKBACK_MINUTES,
     cache_seconds=RESEARCH_CACHE_SECONDS,
+)
+decision_intelligence = DecisionIntelligenceAgent(
+    data,
+    cache_seconds=INTELLIGENCE_CACHE_SECONDS,
+    max_pe=SCREEN_MAX_PE,
+    min_revenue_growth_pct=SCREEN_MIN_REVENUE_GROWTH_PCT,
+    strict_value_screen=FUNDAMENTAL_GATE_STRICT,
+    max_chase_pct=MAX_DAILY_CHASE_PCT,
 )
 _clock_degraded = False
 _verified_open_until = None
@@ -393,6 +408,35 @@ def run_cycle():
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason='technical gate: ' + plan.reason)
             continue
+        if INTELLIGENCE_GATE_ENABLED:
+            intelligence = decision_intelligence.review(item.symbol, current_price=item.price)
+            tech = intelligence.technical
+            fundamentals = intelligence.fundamentals
+            rr_text = f"{tech.reward_risk:.2f}" if tech.reward_risk is not None else "n/a"
+            pe_text = f"{fundamentals.pe_ratio:.1f}" if fundamentals.pe_ratio is not None else "n/a"
+            confidence_text = (
+                f"{fundamentals.match_confidence_pct:.0f}%"
+                if fundamentals.match_confidence_pct is not None else "n/a"
+            )
+            print(
+                f"[DECISION INTELLIGENCE] {item.symbol} "
+                f"{'PASS' if intelligence.allowed else 'BLOCK'} "
+                f"trend={tech.trend} sma50={tech.sma50 if tech.sma50 is not None else 'n/a'} "
+                f"sma200={tech.sma200 if tech.sma200 is not None else 'n/a'} "
+                f"rsi={tech.rsi if tech.rsi is not None else 'n/a'} "
+                f"macd={tech.macd_state} rr={rr_text} pe={pe_text} "
+                f"screen={confidence_text} reason={intelligence.reason}"
+            )
+            if not intelligence.allowed:
+                journal.record_cycle(
+                    symbol=item.symbol,
+                    current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]),
+                    signal=item.signal,
+                    decision='REJECT',
+                    rejection_reason='decision intelligence: ' + intelligence.reason,
+                )
+                continue
         if RESEARCH_GATE_ENABLED:
             try:
                 research = research_gate.review(item.symbol)
@@ -439,7 +483,13 @@ def run():
     print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
     print(f'Paper sizing profile: {PAPER_TUNING_PROFILE}; trade_cap=${MAX_TRADE_NOTIONAL:.2f}; exposure_cap=${MAX_TOTAL_EXPOSURE:.2f}; max_positions={MAX_OPEN_POSITIONS}')
     print(f'Trusted research gate: {"enabled" if RESEARCH_GATE_ENABLED else "disabled"}; news_lookback={NEWS_LOOKBACK_MINUTES}m; cache={RESEARCH_CACHE_SECONDS}s')
-    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print(
+        f'Decision intelligence: {"enabled" if INTELLIGENCE_GATE_ENABLED else "disabled"}; '
+        f'daily_cache={INTELLIGENCE_CACHE_SECONDS}s; max_pe={SCREEN_MAX_PE:g}; '
+        f'min_revenue_growth={SCREEN_MIN_REVENUE_GROWTH_PCT:g}%; '
+        f'fundamental_strict={FUNDAMENTAL_GATE_STRICT}; max_chase={MAX_DAILY_CHASE_PCT*100:.2f}%'
+    )
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
