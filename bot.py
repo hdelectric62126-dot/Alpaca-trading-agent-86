@@ -36,6 +36,7 @@ from advanced_system import (
     ChampionChallengerLab,
     MarketRegimeClassifier,
     PortfolioRiskModel,
+    AdvancedOpportunityRouter,
     build_feature_vector,
 )
 
@@ -150,6 +151,11 @@ decision_intelligence = DecisionIntelligenceAgent(
 intraday_context = IntradayContextAgent(data, cache_seconds=INTRADAY_CONTEXT_CACHE_SECONDS)
 advanced_store = AdvancedFeatureStore(journal.connection)
 advanced_regime_classifier = MarketRegimeClassifier()
+advanced_router = AdvancedOpportunityRouter(
+    minimum_signal_score=MIN_SIGNAL_SCORE,
+    minimum_strategy_score=ADVANCED_MIN_STRATEGY_SCORE,
+    top_n=SCOUT_TOP_N,
+)
 advanced_portfolio = PortfolioRiskModel(
     max_sector_positions=PORTFOLIO_MAX_SECTOR_POSITIONS,
     max_pair_correlation=PORTFOLIO_MAX_CORRELATION,
@@ -423,7 +429,15 @@ def run_cycle():
     regime = assess_market_regime(bars_by_symbol, MARKET_BENCHMARKS)
     print(f"[MARKET REGIME] {'PASS' if regime.allowed else 'BLOCK'}: {regime.reason}; weak={list(regime.weak_benchmarks)}")
     ranked = scout.rank({s: b for s, b in bars_by_symbol.items() if s in SYMBOLS and s not in pos})
-    candidates = scout.candidates(ranked)
+    if ADVANCED_SYSTEM_ENABLED:
+        routed = advanced_router.route(ranked, bars_by_symbol, advanced_regime)
+        candidates = [candidate.opportunity for candidate in routed]
+        routed_strategy = {
+            candidate.opportunity.symbol: candidate.strategy for candidate in routed
+        }
+    else:
+        candidates = scout.candidates(ranked)
+        routed_strategy = {item.symbol: "dip_reversal" for item in candidates}
     selected = {item.symbol for item in candidates}
     for item in ranked:
         if item.symbol not in selected:
@@ -459,8 +473,13 @@ def run_cycle():
                     reason=reason,
                 )
     print('[SCOUT] ' + ', '.join(
-        f"{item.symbol}:{item.signal.score}:{'READY' if item.entry_ready else 'WAIT'}"
+        f"{item.symbol}:{item.signal.score}:{'SELECTED' if item.symbol in selected else 'WAIT'}"
         for item in ranked[:5]))
+    if ADVANCED_SYSTEM_ENABLED and candidates:
+        print('[STRATEGY ROUTER] ' + ', '.join(
+            f"{item.symbol}:{routed_strategy.get(item.symbol, 'unknown')}"
+            for item in candidates
+        ))
     # Execute in rank order, rather than watchlist order.
     for item in candidates:
         if not regime.allowed:
