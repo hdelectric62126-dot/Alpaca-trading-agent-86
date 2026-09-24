@@ -244,20 +244,22 @@ def run_after_hours_learning():
     AfterHoursLearningAgent.log_summary(report)
 
 
-def submit_buy(symbol, price, notional, score=0):
+def submit_buy(symbol, price, notional, score=0, rationale=None):
     notional = float(notional)
     if not math.isfinite(notional) or not 1 <= notional <= MAX_TRADE_NOTIONAL:
         raise ValueError('Buy notional is outside configured limits')
-    order = execution.submit(symbol, 'buy', score=score, notional=round(notional, 2))
+    order = execution.submit(symbol, 'buy', score=score, notional=round(notional, 2),
+                             reference_price=price, rationale=rationale)
     print(f"[PAPER BUY SUBMITTED] {symbol} ${notional:.2f} order={order.id}")
     return order, notional
 
 
-def submit_sell(symbol, qty, reason, entry_price):
+def submit_sell(symbol, qty, reason, entry_price, reference_price=None):
     qty = float(qty)
     if not math.isfinite(qty) or qty <= 0:
         raise ValueError('Sell quantity must be finite and positive')
-    order = execution.submit(symbol, 'sell', quantity=qty, entry_price=entry_price)
+    order = execution.submit(symbol, 'sell', quantity=qty, entry_price=entry_price,
+                             reference_price=reference_price, rationale=reason)
     print(f"[PAPER SELL SUBMITTED] {symbol} qty={qty} reason={reason} order={order.id}")
     return order
 
@@ -301,7 +303,8 @@ def manage_positions(pos, bars_by_symbol, orders):
             identity = tracked['order_id'] if tracked else 'broker-existing'
             decision = exit_agent.decide(symbol, entry, bars, entry_identity=identity)
             if decision.action == 'SELL':
-                order = submit_sell(symbol, qty, decision.reason, entry)
+                order = submit_sell(symbol, qty, decision.reason, entry,
+                                    reference_price=float(bars['close'].iloc[-1]))
                 journal.record_cycle(symbol=symbol, current_price=float(bars['close'].iloc[-1]),
                                      market_data=bar_data(bars), decision='SELL', order=order)
             else:
@@ -481,7 +484,20 @@ def run_cycle():
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason=block or risk.reason)
             continue
-        order, notional = submit_buy(item.symbol, item.price, risk.notional, item.signal.score)
+        rationale_parts = [f"signal_score={item.signal.score}", "technical_quality=passed"]
+        if intraday is not None:
+            rationale_parts.append(f"intraday_alignment={intraday.alignment}")
+        if INTELLIGENCE_GATE_ENABLED:
+            rationale_parts.append(f"daily_trend={intelligence.technical.trend}")
+            rationale_parts.append(
+                f"fundamental_screen={intelligence.fundamentals.match_confidence_pct}"
+            )
+        if RESEARCH_GATE_ENABLED:
+            rationale_parts.append("trusted_research=passed")
+        order, notional = submit_buy(
+            item.symbol, item.price, risk.notional, item.signal.score,
+            rationale="; ".join(rationale_parts),
+        )
         journal.record_cycle(symbol=item.symbol, current_price=item.price,
                              market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                              decision='BUY', order=order)
