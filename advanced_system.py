@@ -451,6 +451,103 @@ class StrategyEnsemble:
         return tuple(sorted(votes, key=lambda x: (-x.score, x.name)))
 
 
+@dataclass(frozen=True)
+class RoutedCandidate:
+    opportunity: object
+    strategy: str
+    strategy_score: float
+    reason: str
+
+
+class AdvancedOpportunityRouter:
+    """Allow independent long-strategy specialists to nominate candidates.
+
+    The legacy dip scout still supplies normalized signal features, but a symbol
+    no longer has to be a dip/reversal setup to reach the quality gates.
+    """
+
+    def __init__(self, *, minimum_signal_score=60, minimum_strategy_score=65, top_n=5):
+        self.minimum_signal_score = int(minimum_signal_score)
+        self.minimum_strategy_score = float(minimum_strategy_score)
+        self.top_n = max(1, int(top_n))
+        self.ensemble = StrategyEnsemble()
+
+    def route(self, opportunities, bars_by_symbol, regime):
+        routed = []
+        for item in opportunities:
+            bars = bars_by_symbol.get(item.symbol)
+            if bars is None or len(bars) < 20:
+                continue
+            closes = bars["close"].astype(float)
+            latest = float(closes.iloc[-1])
+            latest_green = float(bars["close"].iloc[-1]) > float(bars["open"].iloc[-1])
+            prior_high = float(bars["high"].astype(float).iloc[-20:-1].max())
+            features = build_feature_vector(item, regime=regime)
+            features.update(
+                {
+                    "latest_green": latest_green,
+                    "room_to_resistance_pct": max(0.0, (prior_high / latest - 1.0) * 100.0),
+                }
+            )
+            votes = self.ensemble.vote(features)
+            winner = votes[0]
+            signal_ok = item.signal.score >= self.minimum_signal_score
+            strategy_ok = winner.score >= self.minimum_strategy_score
+            above_vwap = item.signal.price_vs_vwap_pct >= 0
+            positive_momentum = item.signal.momentum_pct > 0
+            rvol = item.signal.volume_ratio
+            above_mean = latest >= float(closes.tail(20).mean())
+            near_breakout = latest >= prior_high * 0.999
+
+            ready = False
+            reason = ""
+            if winner.name in {"dip_reversal", "mean_reversion"}:
+                ready = item.entry_ready and signal_ok and strategy_ok
+                reason = "reversal specialist nominated setup"
+            elif winner.name == "momentum":
+                ready = (
+                    signal_ok and strategy_ok and positive_momentum
+                    and above_vwap and rvol >= 1.2 and latest_green
+                )
+                reason = "momentum specialist nominated setup"
+            elif winner.name == "breakout":
+                ready = (
+                    signal_ok and strategy_ok and near_breakout
+                    and rvol >= 1.2 and latest_green
+                )
+                reason = "breakout specialist nominated setup"
+            elif winner.name == "trend_following":
+                ready = (
+                    signal_ok and strategy_ok and above_mean
+                    and above_vwap and positive_momentum and latest_green
+                )
+                reason = "trend specialist nominated setup"
+            else:
+                # Catalyst setups require trusted news/filing evidence and are
+                # therefore evaluated later, not nominated from price alone.
+                reason = "catalyst requires research evidence"
+
+            if ready:
+                routed.append(
+                    RoutedCandidate(
+                        opportunity=item,
+                        strategy=winner.name,
+                        strategy_score=winner.score,
+                        reason=reason,
+                    )
+                )
+
+        routed.sort(
+            key=lambda candidate: (
+                candidate.strategy_score,
+                candidate.opportunity.signal.score,
+                candidate.opportunity.signal.volume_ratio,
+            ),
+            reverse=True,
+        )
+        return routed[: self.top_n]
+
+
 class PortfolioRiskModel:
     def __init__(self, *, max_sector_positions=2, max_pair_correlation=0.90):
         self.max_sector_positions = int(max_sector_positions)
