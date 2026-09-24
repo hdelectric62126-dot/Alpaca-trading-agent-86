@@ -64,8 +64,21 @@ class TradeJournal:
         self.connection.commit()
 
         columns = {row[1] for row in self.connection.execute('PRAGMA table_info(paper_trades)')}
-        if 'fill_verified' not in columns:
-            self.connection.execute('ALTER TABLE paper_trades ADD COLUMN fill_verified INTEGER NOT NULL DEFAULT 0')
+        migrations = {
+            'fill_verified': 'INTEGER NOT NULL DEFAULT 0',
+            'entry_slippage_bps': 'REAL',
+            'exit_slippage_bps': 'REAL',
+            'entry_reason': 'TEXT',
+            'exit_reason': 'TEXT',
+        }
+        changed = False
+        for name, definition in migrations.items():
+            if name not in columns:
+                self.connection.execute(
+                    f'ALTER TABLE paper_trades ADD COLUMN {name} {definition}'
+                )
+                changed = True
+        if changed:
             self.connection.commit()
 
     def record_cycle(self, *, symbol, current_price, market_data, signal=None,
@@ -186,6 +199,14 @@ class PerformanceAnalyzer:
         profits = [float(trade["realized_pnl"]) for trade in closed]
         wins = [value for value in profits if value > 0]
         losses = [value for value in profits if value < 0]
+        entry_slippage = [
+            float(trade["entry_slippage_bps"]) for trade in closed
+            if trade["entry_slippage_bps"] is not None
+        ]
+        exit_slippage = [
+            float(trade["exit_slippage_bps"]) for trade in closed
+            if trade["exit_slippage_bps"] is not None
+        ]
         return {
             "days": int(days), "signals": len(cycles),
             "legacy_estimated_trades_excluded": legacy_count,
@@ -197,6 +218,8 @@ class PerformanceAnalyzer:
             "total_profit_loss": round(sum(profits), 2),
             "average_profit_loss": _round_average(profits),
             "average_win": _round_average(wins), "average_loss": _round_average(losses),
+            "average_entry_slippage_bps": _round_average(entry_slippage),
+            "average_exit_slippage_bps": _round_average(exit_slippage),
             "profit_factor": round(sum(wins) / abs(sum(losses)), 2) if losses else (float("inf") if wins else 0.0),
             "expectancy_per_trade": _round_average(profits),
             "maximum_drawdown": round(_maximum_drawdown(profits), 2),
