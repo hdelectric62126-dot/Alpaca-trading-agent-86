@@ -83,6 +83,18 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn('cap', e2.entry_block('TSM', daily_entries=1))
         self.assertIsNone(e2.entry_block('AMD', now=datetime.now(timezone.utc)+timedelta(days=1)))
 
+    def test_realized_loss_locks_symbol_until_next_trading_day(self):
+        now = datetime.now(timezone.utc)
+        self.j.connection.execute(
+            """INSERT INTO paper_trades
+            (symbol,score,status,quantity,entry_price,exit_price,realized_pnl,opened_at,closed_at,fill_verified)
+            VALUES ('AMD',80,'CLOSED',1,100,99,-1,?,?,1)""",
+            ((now-timedelta(minutes=30)).isoformat(), now.isoformat()),
+        )
+        self.j.connection.commit()
+        self.assertIn('locked after a realized loss', self.e.entry_block('AMD', now=now))
+        self.assertIsNone(self.e.entry_block('AMD', now=now+timedelta(days=1)))
+
     def test_legacy_estimates_excluded_from_performance(self):
         self.j.connection.execute("INSERT INTO paper_trades (symbol,score,status,quantity,realized_pnl,opened_at) VALUES ('AMD',60,'CLOSED',1,99,?)", (datetime.now(timezone.utc).isoformat(),))
         self.j.connection.commit()
