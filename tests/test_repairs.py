@@ -175,9 +175,12 @@ class ResearchRepairTests(unittest.TestCase):
         self.assertEqual(result['trades'], 0)
 
     def test_costs_reduce_backtest_returns(self):
-        bars = make_bars([100]*30 + [98,99,101,102,100,99,101])
+        # Use a confirmed dip/reversal that actually opens a trade under the
+        # current anti-falling-entry rule, then verify slippage reduces P/L.
+        bars = make_bars([100]*30 + [97.0,97.2,97.4,97.6,97.8,100.0,101.0])
         free = walk_forward_backtest(bars, minimum_score=0, slippage_bps=0)
         cost = walk_forward_backtest(bars, minimum_score=0, slippage_bps=10)
+        self.assertGreaterEqual(free['trades'], 1)
         self.assertLess(cost['ending_cash'], free['ending_cash'])
 
     def test_flat_rsi_is_neutral_and_invalid_data_rejected(self):
