@@ -27,6 +27,7 @@ from risk_agent import RiskAgent
 from after_hours_agent import AfterHoursLearningAgent, ResearchCandidate
 from paper_tuning import resolve_paper_sizing
 from trade_gate import assess_market_regime, build_technical_plan
+from research_gate import ResearchGate
 
 
 # ---------------------------
@@ -57,6 +58,9 @@ MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
 MIN_RELATIVE_VOLUME = float(os.getenv("MIN_RELATIVE_VOLUME", "1.0"))
 MIN_REWARD_RISK = float(os.getenv("MIN_REWARD_RISK", "1.0"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "2.0")) / 100.0
+RESEARCH_GATE_ENABLED = os.getenv("RESEARCH_GATE_ENABLED", "true").lower() == "true"
+NEWS_LOOKBACK_MINUTES = int(os.getenv("NEWS_LOOKBACK_MINUTES", "120"))
+RESEARCH_CACHE_SECONDS = int(os.getenv("RESEARCH_CACHE_SECONDS", "300"))
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -101,6 +105,12 @@ risk_agent = RiskAgent(
 )
 after_hours_agent = AfterHoursLearningAgent(
     minimum_test_trades=AFTER_HOURS_MIN_TEST_TRADES,
+)
+research_gate = ResearchGate(
+    API_KEY,
+    SECRET_KEY,
+    news_lookback_minutes=NEWS_LOOKBACK_MINUTES,
+    cache_seconds=RESEARCH_CACHE_SECONDS,
 )
 _clock_degraded = False
 _verified_open_until = None
@@ -383,6 +393,23 @@ def run_cycle():
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason='technical gate: ' + plan.reason)
             continue
+        if RESEARCH_GATE_ENABLED:
+            try:
+                research = research_gate.review(item.symbol)
+            except Exception as exc:
+                journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                     market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                     decision='REJECT', rejection_reason='research gate unavailable: ' + type(exc).__name__)
+                print(f"[RESEARCH GATE] {item.symbol} BLOCK: unavailable {type(exc).__name__}")
+                continue
+            print(f"[RESEARCH GATE] {item.symbol} {'PASS' if research.allowed else 'BLOCK'} "
+                  f"news={len(research.news_headlines)} filings={len(research.recent_filings)} "
+                  f"reason={research.reason}")
+            if not research.allowed:
+                journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                     market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                     decision='REJECT', rejection_reason='research gate: ' + research.reason)
+                continue
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
                                       daily_entries=MAX_DAILY_ENTRIES)
         risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl)
@@ -411,7 +438,8 @@ def run():
     print(f'Virtual strategy bankroll: ${PAPER_BANKROLL:,.2f}')
     print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
     print(f'Paper sizing profile: {PAPER_TUNING_PROFILE}; trade_cap=${MAX_TRADE_NOTIONAL:.2f}; exposure_cap=${MAX_TOTAL_EXPOSURE:.2f}; max_positions={MAX_OPEN_POSITIONS}')
-    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print(f'Trusted research gate: {"enabled" if RESEARCH_GATE_ENABLED else "disabled"}; news_lookback={NEWS_LOOKBACK_MINUTES}m; cache={RESEARCH_CACHE_SECONDS}s')
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
