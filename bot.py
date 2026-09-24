@@ -46,6 +46,7 @@ LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "30"))
 ENTRY_DIP_PCT = float(os.getenv("ENTRY_DIP_PCT", "0.35")) / 100.0
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.45")) / 100.0
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.50")) / 100.0
+PAPER_BANKROLL = float(os.getenv("PAPER_BANKROLL", "500"))
 MAX_TRADE_NOTIONAL = float(os.getenv("MAX_TRADE_NOTIONAL", "25"))
 DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "10"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "10"))
@@ -91,6 +92,7 @@ risk_agent = RiskAgent(
     max_open_positions=MAX_OPEN_POSITIONS,
     daily_profit_target=DAILY_PROFIT_TARGET,
     daily_loss_limit=DAILY_LOSS_LIMIT,
+    paper_bankroll=PAPER_BANKROLL,
 )
 after_hours_agent = AfterHoursLearningAgent(
     minimum_test_trades=AFTER_HOURS_MIN_TEST_TRADES,
@@ -370,7 +372,9 @@ def run():
     except OSError:
         print('[DASHBOARD] feed unavailable; trading loop continues')
     print(f'Paper agent started. Symbols: {SYMBOLS}')
-    print(f'Starting paper equity: ${account_equity():,.2f}')
+    broker_equity = account_equity()
+    print(f'Broker paper equity: ${broker_equity:,.2f} (not used as strategy bankroll)')
+    print(f'Virtual strategy bankroll: ${PAPER_BANKROLL:,.2f}')
     print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
     print(f'Paper sizing profile: {PAPER_TUNING_PROFILE}; trade_cap=${MAX_TRADE_NOTIONAL:.2f}; exposure_cap=${MAX_TOTAL_EXPOSURE:.2f}; max_positions={MAX_OPEN_POSITIONS}')
     print('[AGENT TEAM] Scout, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')

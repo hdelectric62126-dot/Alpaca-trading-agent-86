@@ -43,6 +43,29 @@ class RiskAgentTests(unittest.TestCase):
         self.assertTrue(result.approved)
         self.assertEqual(result.notional, 15.00)
 
+    def test_virtual_bankroll_caps_available_cash(self):
+        agent = RiskAgent(
+            minimum_score=60, max_trade_notional=25,
+            max_total_exposure=75, max_open_positions=3,
+            daily_profit_target=10, daily_loss_limit=10,
+            paper_bankroll=20,
+        )
+        result = agent.assess(score=100, positions=self.positions(15), daily_pnl=0)
+        self.assertTrue(result.approved)
+        self.assertEqual(result.notional, 5.00)
+
+    def test_virtual_bankroll_can_exhaust(self):
+        agent = RiskAgent(
+            minimum_score=60, max_trade_notional=25,
+            max_total_exposure=75, max_open_positions=3,
+            daily_profit_target=10, daily_loss_limit=50,
+            paper_bankroll=20,
+        )
+        result = agent.assess(score=100, positions={}, daily_pnl=-19.5)
+        self.assertFalse(result.approved)
+        self.assertEqual(result.reason, "virtual paper bankroll exhausted")
+
+
 
 if __name__ == "__main__":
     unittest.main()
