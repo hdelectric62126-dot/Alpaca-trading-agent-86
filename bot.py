@@ -26,6 +26,7 @@ from exit_agent import ExitAgent
 from risk_agent import RiskAgent
 from after_hours_agent import AfterHoursLearningAgent, ResearchCandidate
 from paper_tuning import resolve_paper_sizing
+from trade_gate import assess_market_regime, build_technical_plan
 
 
 # ---------------------------
@@ -40,8 +41,9 @@ SECRET_KEY = os.environ["APCA_API_SECRET_KEY"]
 
 # Trading configuration
 SYMBOLS = [s.strip().upper() for s in os.getenv(
-    "SYMBOLS", "AMD,TSM,TSLA,NVDA,AAPL,MSFT,AMZN,META,GOOGL,AVGO"
+    "SYMBOLS", "AMD,TSM,TSLA,NVDA,AAPL,MSFT,AMZN,META,GOOGL,AVGO,JPM,BAC,XOM,CVX,LLY,UNH,CAT,GE,WMT,COST"
 ).split(",") if s.strip()]
+MARKET_BENCHMARKS = tuple(s.strip().upper() for s in os.getenv("MARKET_BENCHMARKS", "SPY,QQQ").split(",") if s.strip())
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "30"))
 ENTRY_DIP_PCT = float(os.getenv("ENTRY_DIP_PCT", "0.35")) / 100.0
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.45")) / 100.0
@@ -52,6 +54,9 @@ DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "10"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "10"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "60"))
+MIN_RELATIVE_VOLUME = float(os.getenv("MIN_RELATIVE_VOLUME", "1.0"))
+MIN_REWARD_RISK = float(os.getenv("MIN_REWARD_RISK", "1.0"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "2.0")) / 100.0
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -295,7 +300,7 @@ def run_cycle():
         return market_state
     pos = positions()
     orders = open_orders()
-    snapshot = market_data_agent.fetch([*pos, *SYMBOLS], held_symbols=pos)
+    snapshot = market_data_agent.fetch([*pos, *SYMBOLS, *MARKET_BENCHMARKS], held_symbols=pos)
     bars_by_symbol = snapshot.bars
     if snapshot.transport_ok:
         guardian.record_success('market_data')
@@ -328,6 +333,8 @@ def run_cycle():
     for symbol in list(exit_agent.high_water):
         if symbol not in pos:
             exit_agent.clear(symbol)
+    regime = assess_market_regime(bars_by_symbol, MARKET_BENCHMARKS)
+    print(f"[MARKET REGIME] {'PASS' if regime.allowed else 'BLOCK'}: {regime.reason}; weak={list(regime.weak_benchmarks)}")
     ranked = scout.rank({s: b for s, b in bars_by_symbol.items() if s in SYMBOLS and s not in pos})
     candidates = scout.candidates(ranked)
     selected = {item.symbol for item in candidates}
@@ -349,6 +356,33 @@ def run_cycle():
         for item in ranked[:5]))
     # Execute in rank order, rather than watchlist order.
     for item in candidates:
+        if not regime.allowed:
+            journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                 market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                 decision='REJECT', rejection_reason='market regime: ' + regime.reason)
+            continue
+        try:
+            plan = build_technical_plan(
+                bars_by_symbol[item.symbol],
+                take_profit_pct=TAKE_PROFIT_PCT,
+                stop_loss_pct=STOP_LOSS_PCT,
+                min_volume_ratio=MIN_RELATIVE_VOLUME,
+                min_reward_risk=MIN_REWARD_RISK,
+                max_atr_pct=MAX_ATR_PCT,
+            )
+        except (ValueError, TypeError) as exc:
+            journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                 market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                 decision='REJECT', rejection_reason='technical gate unavailable: ' + str(exc))
+            continue
+        print(f"[QUALITY GATE] {item.symbol} {'PASS' if plan.allowed else 'BLOCK'} "
+              f"rr={plan.reward_risk:.2f} vol={plan.volume_ratio:.2f}x "
+              f"atr={plan.atr_pct*100:.2f}% vwap={'YES' if plan.vwap_reclaimed else 'NO'}")
+        if not plan.allowed:
+            journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                 market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                 decision='REJECT', rejection_reason='technical gate: ' + plan.reason)
+            continue
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
                                       daily_entries=MAX_DAILY_ENTRIES)
         risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl)
@@ -377,7 +411,7 @@ def run():
     print(f'Virtual strategy bankroll: ${PAPER_BANKROLL:,.2f}')
     print(f'Entry controls: daily cap={MAX_DAILY_ENTRIES}, cooldown={ENTRY_COOLDOWN_MINUTES}m')
     print(f'Paper sizing profile: {PAPER_TUNING_PROFILE}; trade_cap=${MAX_TRADE_NOTIONAL:.2f}; exposure_cap=${MAX_TOTAL_EXPOSURE:.2f}; max_positions={MAX_OPEN_POSITIONS}')
-    print('[AGENT TEAM] Scout, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
