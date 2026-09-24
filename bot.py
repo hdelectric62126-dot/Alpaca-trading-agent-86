@@ -414,6 +414,18 @@ def run_cycle():
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason='technical gate: ' + plan.reason)
             continue
+        intraday = None
+        if INTRADAY_CONTEXT_ENABLED:
+            intraday = intraday_context.fetch(item.symbol)
+            rvol_text = f"{intraday.relative_volume:.2f}x" if intraday.relative_volume is not None else "n/a"
+            vwap_text = f"{intraday.vwap:.2f}" if intraday.vwap is not None else "n/a"
+            print(f"[INTRADAY CONTEXT] {item.symbol} {'PASS' if intraday.allowed else 'BLOCK'} "
+                  f"alignment={intraday.alignment} vwap={vwap_text} rvol={rvol_text} reason={intraday.reason}")
+            if not intraday.allowed:
+                journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                     market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                     decision='REJECT', rejection_reason='intraday context: ' + intraday.reason)
+                continue
         if INTELLIGENCE_GATE_ENABLED:
             intelligence = decision_intelligence.review(item.symbol, current_price=item.price)
             tech = intelligence.technical
@@ -462,7 +474,8 @@ def run_cycle():
                 continue
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
                                       daily_entries=MAX_DAILY_ENTRIES)
-        risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl)
+        risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl,
+                                 stop_loss_pct=STOP_LOSS_PCT)
         if block or not risk.approved:
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
