@@ -374,6 +374,21 @@ def run_cycle():
     orders = open_orders()
     snapshot = market_data_agent.fetch([*pos, *SYMBOLS, *MARKET_BENCHMARKS], held_symbols=pos)
     bars_by_symbol = snapshot.bars
+    advanced_regime = advanced_regime_classifier.classify(
+        bars_by_symbol, MARKET_BENCHMARKS
+    )
+    if ADVANCED_SYSTEM_ENABLED:
+        current_prices = {
+            symbol: float(bars["close"].iloc[-1])
+            for symbol, bars in bars_by_symbol.items()
+            if bars is not None and not bars.empty
+        }
+        resolved_updates = advanced_store.update_counterfactuals(current_prices)
+        print(
+            f"[ADVANCED REGIME] {advanced_regime.name} trend={advanced_regime.trend} "
+            f"vol={advanced_regime.volatility} breadth={advanced_regime.breadth:.2f} "
+            f"counterfactual_updates={resolved_updates}"
+        )
     if snapshot.transport_ok:
         guardian.record_success('market_data')
     else:
@@ -423,6 +438,26 @@ def run_cycle():
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason=reason)
+            if ADVANCED_SYSTEM_ENABLED:
+                basic_features = build_feature_vector(item, regime=advanced_regime)
+                portfolio_assessment = advanced_portfolio.assess(
+                    item.symbol, pos, bars_by_symbol
+                )
+                shadow_meta = advanced_engine.evaluate(
+                    basic_features, advanced_regime, portfolio_assessment
+                )
+                advanced_store.record_opportunity(
+                    symbol=item.symbol,
+                    decision="REJECT_PREFILTER",
+                    strategy=shadow_meta.strategy,
+                    regime=advanced_regime.name,
+                    price=item.price,
+                    score=item.signal.score,
+                    probability=shadow_meta.probability,
+                    expected_value_pct=shadow_meta.expected_value_pct,
+                    features=basic_features,
+                    reason=reason,
+                )
     print('[SCOUT] ' + ', '.join(
         f"{item.symbol}:{item.signal.score}:{'READY' if item.entry_ready else 'WAIT'}"
         for item in ranked[:5]))
@@ -467,6 +502,7 @@ def run_cycle():
                                      market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                      decision='REJECT', rejection_reason='intraday context: ' + intraday.reason)
                 continue
+        intelligence = None
         if INTELLIGENCE_GATE_ENABLED:
             intelligence = decision_intelligence.review(item.symbol, current_price=item.price)
             tech = intelligence.technical
@@ -496,6 +532,7 @@ def run_cycle():
                     rejection_reason='decision intelligence: ' + intelligence.reason,
                 )
                 continue
+        research = None
         if RESEARCH_GATE_ENABLED:
             try:
                 research = research_gate.review(item.symbol)
@@ -513,6 +550,56 @@ def run_cycle():
                                      market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                      decision='REJECT', rejection_reason='research gate: ' + research.reason)
                 continue
+        if ADVANCED_SYSTEM_ENABLED:
+            features = build_feature_vector(
+                item,
+                plan=plan,
+                intraday=intraday,
+                intelligence=intelligence,
+                research=research,
+                regime=advanced_regime,
+            )
+            portfolio_assessment = advanced_portfolio.assess(
+                item.symbol, pos, bars_by_symbol
+            )
+            meta = advanced_engine.evaluate(
+                features, advanced_regime, portfolio_assessment
+            )
+            vote_text = ",".join(
+                f"{vote.name}:{vote.score:.0f}" for vote in meta.votes[:3]
+            )
+            print(
+                f"[META DECISION] {item.symbol} {'PASS' if meta.allowed else 'BLOCK'} "
+                f"strategy={meta.strategy} regime={meta.regime} "
+                f"p={meta.probability:.3f} ev={meta.expected_value_pct:.3f}% "
+                f"cal_n={meta.calibration_sample} votes={vote_text} "
+                f"portfolio={meta.portfolio_reason} reason={meta.reason}"
+            )
+            advanced_store.record_opportunity(
+                symbol=item.symbol,
+                decision="ADVANCED_PASS" if meta.allowed else "ADVANCED_BLOCK",
+                strategy=meta.strategy,
+                regime=meta.regime,
+                price=item.price,
+                score=item.signal.score,
+                probability=meta.probability,
+                expected_value_pct=meta.expected_value_pct,
+                features=features,
+                reason=meta.reason,
+            )
+            if not meta.allowed:
+                journal.record_cycle(
+                    symbol=item.symbol,
+                    current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]),
+                    signal=item.signal,
+                    decision='REJECT',
+                    rejection_reason='advanced meta-decision: ' + meta.reason,
+                )
+                continue
+        else:
+            meta = None
+
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
                                       daily_entries=MAX_DAILY_ENTRIES)
         risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl,
@@ -523,6 +610,13 @@ def run_cycle():
                                  decision='REJECT', rejection_reason=block or risk.reason)
             continue
         rationale_parts = [f"signal_score={item.signal.score}", "technical_quality=passed"]
+        if meta is not None:
+            rationale_parts.extend([
+                f"strategy={meta.strategy}",
+                f"regime={meta.regime}",
+                f"probability={meta.probability:.3f}",
+                f"expected_value_pct={meta.expected_value_pct:.3f}",
+            ])
         if intraday is not None:
             rationale_parts.append(f"intraday_alignment={intraday.alignment}")
         if INTELLIGENCE_GATE_ENABLED:
