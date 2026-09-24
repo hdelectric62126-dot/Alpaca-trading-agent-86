@@ -14,19 +14,23 @@ class RiskDecision:
 class RiskAgent:
     def __init__(self, *, minimum_score, max_trade_notional,
                  max_total_exposure, max_open_positions,
-                 daily_profit_target, daily_loss_limit):
+                 daily_profit_target, daily_loss_limit,
+                 paper_bankroll=500.0):
         self.minimum_score = int(minimum_score)
         self.max_trade_notional = float(max_trade_notional)
         self.max_total_exposure = float(max_total_exposure)
         self.max_open_positions = int(max_open_positions)
         self.daily_profit_target = float(daily_profit_target)
         self.daily_loss_limit = float(daily_loss_limit)
+        self.paper_bankroll = float(paper_bankroll)
 
     def assess(self, *, score, positions, daily_pnl, has_open_order=False):
         values = [daily_pnl, score, self.max_trade_notional, self.max_total_exposure,
-                  self.daily_profit_target, self.daily_loss_limit]
+                  self.daily_profit_target, self.daily_loss_limit, self.paper_bankroll]
         if not all(math.isfinite(float(v)) for v in values):
             return RiskDecision(False, 0.0, 'invalid risk inputs')
+        if self.paper_bankroll <= 0:
+            return RiskDecision(False, 0.0, 'invalid paper bankroll')
         if any(not math.isfinite(float(getattr(p, 'market_value', float('nan')))) for p in positions.values()):
             return RiskDecision(False, 0.0, 'invalid portfolio exposure')
         if daily_pnl >= self.daily_profit_target:
@@ -42,7 +46,11 @@ class RiskAgent:
 
         exposure = sum(abs(float(getattr(position, "market_value", 0) or 0))
                        for position in positions.values())
-        available = max(0.0, self.max_total_exposure - exposure)
+        effective_equity = max(0.0, self.paper_bankroll + float(daily_pnl))
+        available = max(0.0, min(self.max_total_exposure - exposure,
+                                 effective_equity - exposure))
+        if effective_equity < 1.0:
+            return RiskDecision(False, 0.0, "virtual paper bankroll exhausted")
         if available < 1.0:
             return RiskDecision(False, 0.0, "portfolio exposure limit reached")
 
