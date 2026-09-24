@@ -30,6 +30,14 @@ from trade_gate import assess_market_regime, build_technical_plan
 from research_gate import ResearchGate
 from decision_intelligence import DecisionIntelligenceAgent
 from intraday_intelligence import IntradayContextAgent
+from advanced_system import (
+    AdvancedDecisionEngine,
+    AdvancedFeatureStore,
+    ChampionChallengerLab,
+    MarketRegimeClassifier,
+    PortfolioRiskModel,
+    build_feature_vector,
+)
 
 
 # ---------------------------
@@ -72,6 +80,13 @@ MAX_DAILY_CHASE_PCT = float(os.getenv("MAX_DAILY_CHASE_PCT", "2.5")) / 100.0
 INTRADAY_CONTEXT_ENABLED = os.getenv("INTRADAY_CONTEXT_ENABLED", "true").lower() == "true"
 INTRADAY_CONTEXT_CACHE_SECONDS = int(os.getenv("INTRADAY_CONTEXT_CACHE_SECONDS", "180"))
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "1.0")) / 100.0
+ADVANCED_SYSTEM_ENABLED = os.getenv("ADVANCED_SYSTEM_ENABLED", "true").lower() == "true"
+ADVANCED_MIN_STRATEGY_SCORE = float(os.getenv("ADVANCED_MIN_STRATEGY_SCORE", "60"))
+ADVANCED_MIN_PROBABILITY = float(os.getenv("ADVANCED_MIN_PROBABILITY", "0.50"))
+ADVANCED_MIN_EV_PCT = float(os.getenv("ADVANCED_MIN_EV_PCT", "0.0"))
+PORTFOLIO_MAX_SECTOR_POSITIONS = int(os.getenv("PORTFOLIO_MAX_SECTOR_POSITIONS", "2"))
+PORTFOLIO_MAX_CORRELATION = float(os.getenv("PORTFOLIO_MAX_CORRELATION", "0.90"))
+CHALLENGER_MIN_SAMPLE = int(os.getenv("CHALLENGER_MIN_SAMPLE", "30"))
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -133,6 +148,24 @@ decision_intelligence = DecisionIntelligenceAgent(
     max_chase_pct=MAX_DAILY_CHASE_PCT,
 )
 intraday_context = IntradayContextAgent(data, cache_seconds=INTRADAY_CONTEXT_CACHE_SECONDS)
+advanced_store = AdvancedFeatureStore(journal.connection)
+advanced_regime_classifier = MarketRegimeClassifier()
+advanced_portfolio = PortfolioRiskModel(
+    max_sector_positions=PORTFOLIO_MAX_SECTOR_POSITIONS,
+    max_pair_correlation=PORTFOLIO_MAX_CORRELATION,
+)
+advanced_engine = AdvancedDecisionEngine(
+    advanced_store,
+    take_profit_pct=TAKE_PROFIT_PCT,
+    stop_loss_pct=STOP_LOSS_PCT,
+    minimum_strategy_score=ADVANCED_MIN_STRATEGY_SCORE,
+    minimum_probability=ADVANCED_MIN_PROBABILITY,
+    minimum_expected_value_pct=ADVANCED_MIN_EV_PCT,
+)
+research_lab = ChampionChallengerLab(
+    advanced_store,
+    minimum_sample=CHALLENGER_MIN_SAMPLE,
+)
 _clock_degraded = False
 _verified_open_until = None
 
@@ -242,6 +275,9 @@ def run_after_hours_learning():
     )
     report = after_hours_agent.run(bars_by_symbol, current)
     AfterHoursLearningAgent.log_summary(report)
+    if ADVANCED_SYSTEM_ENABLED:
+        lab_report = research_lab.run()
+        ChampionChallengerLab.log_summary(lab_report)
 
 
 def submit_buy(symbol, price, notional, score=0, rationale=None):
