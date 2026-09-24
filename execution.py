@@ -182,6 +182,11 @@ class PaperExecution:
         count = self.db.execute("SELECT COUNT(*) FROM order_intents WHERE side='buy' AND created_at>=?", (start,)).fetchone()[0]
         if count >= daily_entries:
             return 'daily entry attempt cap reached'
+        if self.db.execute(
+                "SELECT 1 FROM paper_trades WHERE symbol=? AND status='CLOSED' "
+                "AND fill_verified=1 AND realized_pnl < 0 AND closed_at>=? LIMIT 1",
+                (symbol, start)).fetchone():
+            return 'symbol locked after a realized loss today'
         cutoff = (now-timedelta(minutes=cooldown_minutes)).isoformat()
         if self.db.execute("SELECT 1 FROM order_intents WHERE symbol=? AND (status='pending' OR created_at>=? OR completed_at>=?) LIMIT 1",
                            (symbol, cutoff, cutoff)).fetchone():
