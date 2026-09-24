@@ -661,7 +661,16 @@ def run():
         f'cache={INTRADAY_CONTEXT_CACHE_SECONDS}s; '
         f'max_risk_per_trade={MAX_RISK_PER_TRADE_PCT*100:.2f}%'
     )
-    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Multi-Timeframe Intraday Context, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print(
+        f'Advanced system: {"enabled" if ADVANCED_SYSTEM_ENABLED else "disabled"}; '
+        f'min_strategy={ADVANCED_MIN_STRATEGY_SCORE:.0f}; '
+        f'min_probability={ADVANCED_MIN_PROBABILITY:.2f}; '
+        f'min_ev={ADVANCED_MIN_EV_PCT:.3f}%; '
+        f'sector_limit={PORTFOLIO_MAX_SECTOR_POSITIONS}; '
+        f'max_corr={PORTFOLIO_MAX_CORRELATION:.2f}; '
+        f'challenger_min_n={CHALLENGER_MIN_SAMPLE}'
+    )
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Multi-Timeframe Intraday Context, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Strategy Ensemble, Probability Calibration, Meta Decision, Portfolio Correlation Risk, Counterfactual Tracker, Champion-Challenger Lab, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
