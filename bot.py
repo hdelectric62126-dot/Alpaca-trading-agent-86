@@ -29,6 +29,7 @@ from paper_tuning import resolve_paper_sizing
 from trade_gate import assess_market_regime, build_technical_plan
 from research_gate import ResearchGate
 from decision_intelligence import DecisionIntelligenceAgent
+from intraday_intelligence import IntradayContextAgent
 
 
 # ---------------------------
@@ -68,6 +69,9 @@ SCREEN_MAX_PE = float(os.getenv("SCREEN_MAX_PE", "20"))
 SCREEN_MIN_REVENUE_GROWTH_PCT = float(os.getenv("SCREEN_MIN_REVENUE_GROWTH_PCT", "8"))
 FUNDAMENTAL_GATE_STRICT = os.getenv("FUNDAMENTAL_GATE_STRICT", "false").lower() == "true"
 MAX_DAILY_CHASE_PCT = float(os.getenv("MAX_DAILY_CHASE_PCT", "2.5")) / 100.0
+INTRADAY_CONTEXT_ENABLED = os.getenv("INTRADAY_CONTEXT_ENABLED", "true").lower() == "true"
+INTRADAY_CONTEXT_CACHE_SECONDS = int(os.getenv("INTRADAY_CONTEXT_CACHE_SECONDS", "180"))
+MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "1.0")) / 100.0
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -109,6 +113,7 @@ risk_agent = RiskAgent(
     daily_profit_target=DAILY_PROFIT_TARGET,
     daily_loss_limit=DAILY_LOSS_LIMIT,
     paper_bankroll=PAPER_BANKROLL,
+    max_risk_per_trade_pct=MAX_RISK_PER_TRADE_PCT,
 )
 after_hours_agent = AfterHoursLearningAgent(
     minimum_test_trades=AFTER_HOURS_MIN_TEST_TRADES,
@@ -127,6 +132,7 @@ decision_intelligence = DecisionIntelligenceAgent(
     strict_value_screen=FUNDAMENTAL_GATE_STRICT,
     max_chase_pct=MAX_DAILY_CHASE_PCT,
 )
+intraday_context = IntradayContextAgent(data, cache_seconds=INTRADAY_CONTEXT_CACHE_SECONDS)
 _clock_degraded = False
 _verified_open_until = None
 
