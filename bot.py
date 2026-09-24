@@ -29,6 +29,7 @@ from paper_tuning import resolve_paper_sizing
 from trade_gate import assess_market_regime, build_technical_plan
 from research_gate import ResearchGate
 from decision_intelligence import DecisionIntelligenceAgent
+from intraday_intelligence import IntradayContextAgent
 
 
 # ---------------------------
@@ -68,6 +69,9 @@ SCREEN_MAX_PE = float(os.getenv("SCREEN_MAX_PE", "20"))
 SCREEN_MIN_REVENUE_GROWTH_PCT = float(os.getenv("SCREEN_MIN_REVENUE_GROWTH_PCT", "8"))
 FUNDAMENTAL_GATE_STRICT = os.getenv("FUNDAMENTAL_GATE_STRICT", "false").lower() == "true"
 MAX_DAILY_CHASE_PCT = float(os.getenv("MAX_DAILY_CHASE_PCT", "2.5")) / 100.0
+INTRADAY_CONTEXT_ENABLED = os.getenv("INTRADAY_CONTEXT_ENABLED", "true").lower() == "true"
+INTRADAY_CONTEXT_CACHE_SECONDS = int(os.getenv("INTRADAY_CONTEXT_CACHE_SECONDS", "180"))
+MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "1.0")) / 100.0
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -109,6 +113,7 @@ risk_agent = RiskAgent(
     daily_profit_target=DAILY_PROFIT_TARGET,
     daily_loss_limit=DAILY_LOSS_LIMIT,
     paper_bankroll=PAPER_BANKROLL,
+    max_risk_per_trade_pct=MAX_RISK_PER_TRADE_PCT,
 )
 after_hours_agent = AfterHoursLearningAgent(
     minimum_test_trades=AFTER_HOURS_MIN_TEST_TRADES,
@@ -127,6 +132,7 @@ decision_intelligence = DecisionIntelligenceAgent(
     strict_value_screen=FUNDAMENTAL_GATE_STRICT,
     max_chase_pct=MAX_DAILY_CHASE_PCT,
 )
+intraday_context = IntradayContextAgent(data, cache_seconds=INTRADAY_CONTEXT_CACHE_SECONDS)
 _clock_degraded = False
 _verified_open_until = None
 
@@ -238,20 +244,22 @@ def run_after_hours_learning():
     AfterHoursLearningAgent.log_summary(report)
 
 
-def submit_buy(symbol, price, notional, score=0):
+def submit_buy(symbol, price, notional, score=0, rationale=None):
     notional = float(notional)
     if not math.isfinite(notional) or not 1 <= notional <= MAX_TRADE_NOTIONAL:
         raise ValueError('Buy notional is outside configured limits')
-    order = execution.submit(symbol, 'buy', score=score, notional=round(notional, 2))
+    order = execution.submit(symbol, 'buy', score=score, notional=round(notional, 2),
+                             reference_price=price, rationale=rationale)
     print(f"[PAPER BUY SUBMITTED] {symbol} ${notional:.2f} order={order.id}")
     return order, notional
 
 
-def submit_sell(symbol, qty, reason, entry_price):
+def submit_sell(symbol, qty, reason, entry_price, reference_price=None):
     qty = float(qty)
     if not math.isfinite(qty) or qty <= 0:
         raise ValueError('Sell quantity must be finite and positive')
-    order = execution.submit(symbol, 'sell', quantity=qty, entry_price=entry_price)
+    order = execution.submit(symbol, 'sell', quantity=qty, entry_price=entry_price,
+                             reference_price=reference_price, rationale=reason)
     print(f"[PAPER SELL SUBMITTED] {symbol} qty={qty} reason={reason} order={order.id}")
     return order
 
@@ -267,7 +275,9 @@ def daily_summary():
         f"[PAPER DAILY] signals={report['signals']} accepted={report['accepted_signals']} "
         f"rejected={report['rejected_signals']} trades={report['paper_trades']} "
         f"wins={report['wins']} losses={report['losses']} "
-        f"P/L=${report['total_profit_loss']:.2f} drawdown=${report['maximum_drawdown']:.2f}"
+        f"P/L=${report['total_profit_loss']:.2f} drawdown=${report['maximum_drawdown']:.2f} "
+        f"entry_slip={report['average_entry_slippage_bps']:.2f}bps "
+        f"exit_slip={report['average_exit_slippage_bps']:.2f}bps"
     )
     PerformanceAgent.log_summary(performance_agent.analyze(PERFORMANCE_DAYS))
 
@@ -295,7 +305,8 @@ def manage_positions(pos, bars_by_symbol, orders):
             identity = tracked['order_id'] if tracked else 'broker-existing'
             decision = exit_agent.decide(symbol, entry, bars, entry_identity=identity)
             if decision.action == 'SELL':
-                order = submit_sell(symbol, qty, decision.reason, entry)
+                order = submit_sell(symbol, qty, decision.reason, entry,
+                                    reference_price=float(bars['close'].iloc[-1]))
                 journal.record_cycle(symbol=symbol, current_price=float(bars['close'].iloc[-1]),
                                      market_data=bar_data(bars), decision='SELL', order=order)
             else:
@@ -408,6 +419,18 @@ def run_cycle():
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason='technical gate: ' + plan.reason)
             continue
+        intraday = None
+        if INTRADAY_CONTEXT_ENABLED:
+            intraday = intraday_context.fetch(item.symbol)
+            rvol_text = f"{intraday.relative_volume:.2f}x" if intraday.relative_volume is not None else "n/a"
+            vwap_text = f"{intraday.vwap:.2f}" if intraday.vwap is not None else "n/a"
+            print(f"[INTRADAY CONTEXT] {item.symbol} {'PASS' if intraday.allowed else 'BLOCK'} "
+                  f"alignment={intraday.alignment} vwap={vwap_text} rvol={rvol_text} reason={intraday.reason}")
+            if not intraday.allowed:
+                journal.record_cycle(symbol=item.symbol, current_price=item.price,
+                                     market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                                     decision='REJECT', rejection_reason='intraday context: ' + intraday.reason)
+                continue
         if INTELLIGENCE_GATE_ENABLED:
             intelligence = decision_intelligence.review(item.symbol, current_price=item.price)
             tech = intelligence.technical
@@ -456,13 +479,27 @@ def run_cycle():
                 continue
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
                                       daily_entries=MAX_DAILY_ENTRIES)
-        risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl)
+        risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl,
+                                 stop_loss_pct=STOP_LOSS_PCT)
         if block or not risk.approved:
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason=block or risk.reason)
             continue
-        order, notional = submit_buy(item.symbol, item.price, risk.notional, item.signal.score)
+        rationale_parts = [f"signal_score={item.signal.score}", "technical_quality=passed"]
+        if intraday is not None:
+            rationale_parts.append(f"intraday_alignment={intraday.alignment}")
+        if INTELLIGENCE_GATE_ENABLED:
+            rationale_parts.append(f"daily_trend={intelligence.technical.trend}")
+            rationale_parts.append(
+                f"fundamental_screen={intelligence.fundamentals.match_confidence_pct}"
+            )
+        if RESEARCH_GATE_ENABLED:
+            rationale_parts.append("trusted_research=passed")
+        order, notional = submit_buy(
+            item.symbol, item.price, risk.notional, item.signal.score,
+            rationale="; ".join(rationale_parts),
+        )
         journal.record_cycle(symbol=item.symbol, current_price=item.price,
                              market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                              decision='BUY', order=order)
@@ -489,7 +526,12 @@ def run():
         f'min_revenue_growth={SCREEN_MIN_REVENUE_GROWTH_PCT:g}%; '
         f'fundamental_strict={FUNDAMENTAL_GATE_STRICT}; max_chase={MAX_DAILY_CHASE_PCT*100:.2f}%'
     )
-    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print(
+        f'Intraday context: {"enabled" if INTRADAY_CONTEXT_ENABLED else "disabled"}; '
+        f'cache={INTRADAY_CONTEXT_CACHE_SECONDS}s; '
+        f'max_risk_per_trade={MAX_RISK_PER_TRADE_PCT*100:.2f}%'
+    )
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Multi-Timeframe Intraday Context, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
