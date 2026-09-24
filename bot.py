@@ -275,7 +275,9 @@ def daily_summary():
         f"[PAPER DAILY] signals={report['signals']} accepted={report['accepted_signals']} "
         f"rejected={report['rejected_signals']} trades={report['paper_trades']} "
         f"wins={report['wins']} losses={report['losses']} "
-        f"P/L=${report['total_profit_loss']:.2f} drawdown=${report['maximum_drawdown']:.2f}"
+        f"P/L=${report['total_profit_loss']:.2f} drawdown=${report['maximum_drawdown']:.2f} "
+        f"entry_slip={report['average_entry_slippage_bps']:.2f}bps "
+        f"exit_slip={report['average_exit_slippage_bps']:.2f}bps"
     )
     PerformanceAgent.log_summary(performance_agent.analyze(PERFORMANCE_DAYS))
 
@@ -524,7 +526,12 @@ def run():
         f'min_revenue_growth={SCREEN_MIN_REVENUE_GROWTH_PCT:g}%; '
         f'fundamental_strict={FUNDAMENTAL_GATE_STRICT}; max_chase={MAX_DAILY_CHASE_PCT*100:.2f}%'
     )
-    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print(
+        f'Intraday context: {"enabled" if INTRADAY_CONTEXT_ENABLED else "disabled"}; '
+        f'cache={INTRADAY_CONTEXT_CACHE_SECONDS}s; '
+        f'max_risk_per_trade={MAX_RISK_PER_TRADE_PCT*100:.2f}%'
+    )
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Multi-Timeframe Intraday Context, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
