@@ -24,15 +24,26 @@ class PaperExecution:
         self.db.execute('''CREATE TABLE IF NOT EXISTS order_intents (
             client_id TEXT PRIMARY KEY, order_id TEXT, symbol TEXT NOT NULL,
             side TEXT NOT NULL, score INTEGER NOT NULL, entry_price REAL,
-            notional REAL, quantity REAL, created_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending', filled_qty REAL DEFAULT 0,
-            filled_price REAL, completed_at TEXT)''')
+            notional REAL, quantity REAL, reference_price REAL, rationale TEXT,
+            created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            filled_qty REAL DEFAULT 0, filled_price REAL, slippage_bps REAL,
+            completed_at TEXT)''')
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(order_intents)')}
+        migrations = {
+            'reference_price': 'REAL',
+            'rationale': 'TEXT',
+            'slippage_bps': 'REAL',
+        }
+        for name, definition in migrations.items():
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE order_intents ADD COLUMN {name} {definition}')
         self.db.commit()
 
     def pending(self):
         return self.db.execute("SELECT * FROM order_intents WHERE status = 'pending'").fetchall()
 
-    def submit(self, symbol, side, *, score=0, notional=None, quantity=None, entry_price=None):
+    def submit(self, symbol, side, *, score=0, notional=None, quantity=None,
+               entry_price=None, reference_price=None, rationale=None):
         if not isinstance(symbol, str) or not symbol.strip():
             raise ValueError('Symbol is required')
         symbol = symbol.strip().upper()
@@ -41,11 +52,13 @@ class PaperExecution:
             raise ValueError('Score must be an integer between 0 and 100')
         if (notional is None) == (quantity is None):
             raise ValueError('Provide exactly one of notional or quantity')
-        for amount in (notional, quantity, entry_price):
+        for amount in (notional, quantity, entry_price, reference_price):
             if amount is not None and (isinstance(amount, bool) or not math.isfinite(float(amount)) or float(amount) <= 0):
                 raise ValueError('Order amounts must be finite and positive')
         if side == 'sell' and (quantity is None or entry_price is None):
             raise ValueError('Sell requires quantity and entry basis')
+        if rationale is not None and len(str(rationale)) > 2000:
+            raise ValueError('Order rationale is too long')
         if any(row['symbol'] == symbol for row in self.pending()):
             raise RuntimeError(f"Unresolved order for {symbol}; refusing duplicate")
         client_id = 'agent86-' + uuid.uuid4().hex
@@ -56,9 +69,11 @@ class PaperExecution:
         # Commit before sending: an ambiguous timeout must never trigger another order.
         with self.db:
             self.db.execute('''INSERT INTO order_intents
-                (client_id, symbol, side, score, entry_price, notional, quantity, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                 (client_id, symbol, side, score, entry_price, notional, quantity,
+                 reference_price, rationale, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (client_id, symbol, side, score, entry_price, notional, quantity,
+                 reference_price, str(rationale) if rationale is not None else None,
                  datetime.now(timezone.utc).isoformat()))
         try:
             order = self.trading.submit_order(order_data=request)
@@ -132,14 +147,25 @@ class PaperExecution:
         if completed > now + timedelta(minutes=1) or completed < datetime.fromisoformat(row['created_at']) - timedelta(seconds=5):
             raise ValueError('Broker timestamp is outside intent lifetime')
         completed = completed.isoformat()
+        reference_price = float(row['reference_price']) if row['reference_price'] is not None else None
+        slippage_bps = None
+        if qty > 0 and reference_price is not None:
+            if not math.isfinite(reference_price) or reference_price <= 0:
+                raise ValueError('Invalid reference price')
+            if row['side'] == 'buy':
+                slippage_bps = (price - reference_price) / reference_price * 10000
+            else:
+                slippage_bps = (reference_price - price) / reference_price * 10000
         realized_pnl = None
         with self.db:
             if qty > 0:
                 if row['side'] == 'buy':
                     self.db.execute('''INSERT INTO paper_trades
-                        (symbol,score,order_id,status,quantity,entry_price,opened_at,fill_verified)
-                        VALUES (?,?,?,'OPEN',?,?,?,1)''',
-                        (row['symbol'], row['score'], str(order.id), qty, price, completed))
+                        (symbol,score,order_id,status,quantity,entry_price,opened_at,fill_verified,
+                         entry_slippage_bps,entry_reason)
+                        VALUES (?,?,?,'OPEN',?,?,?,1,?,?)''',
+                        (row['symbol'], row['score'], str(order.id), qty, price, completed,
+                         slippage_bps, row['rationale']))
                 else:
                     entry = float(row['entry_price'])
                     if not math.isfinite(entry) or entry <= 0:
@@ -160,19 +186,24 @@ class PaperExecution:
                             break
                     realized_pnl = (price-entry)*qty
                     self.db.execute('''INSERT INTO paper_trades
-                        (symbol,score,order_id,status,quantity,entry_price,exit_price,realized_pnl,opened_at,closed_at,fill_verified)
-                        VALUES (?,?,?,'CLOSED',?,?,?,?,?,?,1)''',
+                        (symbol,score,order_id,status,quantity,entry_price,exit_price,realized_pnl,
+                         opened_at,closed_at,fill_verified,entry_slippage_bps,exit_slippage_bps,
+                         entry_reason,exit_reason)
+                        VALUES (?,?,?,'CLOSED',?,?,?,?,?,?,1,?,?,?,?)''',
                         (row['symbol'], trade['score'] if trade else 0, str(order.id), qty,
                          entry, price, realized_pnl,
-                         trade['opened_at'] if trade else row['created_at'], completed))
+                         trade['opened_at'] if trade else row['created_at'], completed,
+                         trade['entry_slippage_bps'] if trade else None, slippage_bps,
+                         trade['entry_reason'] if trade else None, row['rationale']))
             self.db.execute('''UPDATE order_intents SET status=?, order_id=?, filled_qty=?,
-                            filled_price=?, completed_at=? WHERE client_id=?''',
-                            (status, str(order.id), qty, price or None, completed, client_id))
+                            filled_price=?, slippage_bps=?, completed_at=? WHERE client_id=?''',
+                            (status, str(order.id), qty, price or None, slippage_bps, completed, client_id))
         if qty > 0:
+            slip = f" slippage={slippage_bps:.2f}bps" if slippage_bps is not None else ""
             if row['side'] == 'buy':
-                print(f"[FILL VERIFIED] BUY {row['symbol']} qty={qty:.9f} price={price:.4f} broker_status={status}")
+                print(f"[FILL VERIFIED] BUY {row['symbol']} qty={qty:.9f} price={price:.4f}{slip} broker_status={status}")
             else:
-                print(f"[FILL VERIFIED] SELL {row['symbol']} qty={qty:.9f} price={price:.4f} realized_pnl=${realized_pnl:.4f} broker_status={status}")
+                print(f"[FILL VERIFIED] SELL {row['symbol']} qty={qty:.9f} price={price:.4f}{slip} realized_pnl=${realized_pnl:.4f} broker_status={status}")
 
     def entry_block(self, symbol, now=None, cooldown_minutes=30, daily_entries=6):
         now = now or datetime.now(timezone.utc)
