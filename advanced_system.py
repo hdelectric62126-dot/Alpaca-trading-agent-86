@@ -689,7 +689,13 @@ class AdvancedDecisionEngine:
             if calibration["probability"] is not None
             else base_probability
         )
-        cost_pct = self.store.estimated_round_trip_cost_pct()
+        historical_cost_pct = self.store.estimated_round_trip_cost_pct()
+        spread_bps = features.get("spread_bps")
+        current_spread_cost_pct = (
+            max(0.0, float(spread_bps)) / 100.0
+            if _finite(spread_bps) else 0.0
+        )
+        cost_pct = max(historical_cost_pct, current_spread_cost_pct)
         expected_value_pct = (
             probability * self.take_profit_pct * 100.0
             - (1.0 - probability) * self.stop_loss_pct * 100.0
@@ -837,6 +843,7 @@ def build_feature_vector(
     intelligence=None,
     research=None,
     regime=None,
+    quote=None,
 ):
     features = {
         "signal_score": float(item.signal.score),
@@ -896,6 +903,16 @@ def build_feature_vector(
                 "market_volatility": regime.volatility,
                 "market_breadth": regime.breadth,
                 "benchmark_momentum_pct": regime.benchmark_momentum_pct,
+            }
+        )
+    if quote is not None:
+        features.update(
+            {
+                "quote_available": bool(quote.available),
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "mid": quote.mid,
+                "spread_bps": quote.spread_bps,
             }
         )
     # SQLite JSON is strict; convert NaN/Inf to null.
