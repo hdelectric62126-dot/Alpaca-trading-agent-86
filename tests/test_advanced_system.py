@@ -12,6 +12,7 @@ from advanced_system import (
     MarketRegimeClassifier,
     PortfolioRiskModel,
     StrategyEnsemble,
+    strategy_quality_decision,
 )
 from journal import TradeJournal
 
@@ -162,6 +163,60 @@ class AdvancedSystemTests(unittest.TestCase):
         self.assertEqual(len(routed), 1)
         self.assertIn(routed[0].strategy, {"momentum", "breakout", "trend_following"})
         self.assertFalse(item.entry_ready)
+
+    def test_catalyst_news_can_nominate_price_confirmed_setup(self):
+        regime = MarketRegimeClassifier().classify(
+            {"SPY": bars(), "QQQ": bars(start=200)}
+        )
+        signal = NS(
+            score=60,
+            dip_pct=0.0,
+            rsi=60,
+            momentum_pct=0.001,
+            volume_ratio=1.1,
+            price_vs_vwap_pct=0.002,
+        )
+        item = NS(
+            symbol="AMD",
+            price=float(bars()["close"].iloc[-1]),
+            signal=signal,
+            entry_ready=False,
+            reversal_confirmed=False,
+        )
+        routed = AdvancedOpportunityRouter(
+            minimum_signal_score=60,
+            minimum_strategy_score=60,
+            top_n=3,
+        ).route(
+            [item],
+            {"AMD": bars()},
+            regime,
+            catalysts={"AMD": {"count": 2, "risky_count": 0}},
+        )
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0].strategy, "catalyst")
+
+    def test_strategy_quality_does_not_apply_mean_reversion_resistance_rule_to_breakout(self):
+        item = NS(price=101.0)
+        plan = NS(
+            allowed=False,
+            reason="reward/risk 0.00 is below 1.00",
+            latest_green=True,
+            vwap_reclaimed=True,
+            recovery_trend_up=True,
+            volume_ratio=1.5,
+            atr_pct=0.01,
+            resistance=100.8,
+            reward_risk=0.0,
+        )
+        allowed, reason = strategy_quality_decision(
+            "breakout",
+            item,
+            plan,
+            min_volume_ratio=1.0,
+            max_atr_pct=0.02,
+        )
+        self.assertTrue(allowed, reason)
 
     def test_portfolio_model_blocks_high_correlation(self):
         candidate = bars()
