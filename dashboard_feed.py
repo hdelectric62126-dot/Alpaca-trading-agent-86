@@ -80,7 +80,7 @@ def dashboard_snapshot(path, days=7):
         cycles=cycles,rejections=rejects,orders=intents,guardian=health))
 
 
-def make_handler(path, token):
+def make_handler(path, token, ops_token=''):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -99,7 +99,9 @@ def make_handler(path, token):
             parsed=urlsplit(self.path)
             if parsed.path=='/health':
                 return self.respond(200,{'status':'available'})
-            if not token or not hmac.compare_digest(self.headers.get('Authorization',''), 'Bearer '+token):
+            supplied=self.headers.get('Authorization','')
+            authorized=(bool(token) and hmac.compare_digest(supplied,'Bearer '+token)) or (bool(ops_token) and hmac.compare_digest(supplied,'Bearer '+ops_token))
+            if not authorized:
                 return self.respond(401,{'error':'Unauthorized'})
             if parsed.path!='/api/dashboard':
                 return self.respond(404,{'error':'Not found'})
@@ -117,10 +119,11 @@ def make_handler(path, token):
 
 def start_dashboard_feed(path):
     token=os.getenv('DASHBOARD_READ_TOKEN','')
-    if len(token)<32:
+    ops_token=os.getenv('OPS_READ_TOKEN','')
+    if len(token)<32 and len(ops_token)<32:
         print('[DASHBOARD] feed disabled; read token not configured')
         return None
-    server=ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','8080'))),make_handler(path,token))
+    server=ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','8080'))),make_handler(path,token,ops_token))
     thread=threading.Thread(target=server.serve_forever,daemon=True,name='dashboard-read-only')
     thread.start()
     print('[DASHBOARD] authenticated read-only feed started')
