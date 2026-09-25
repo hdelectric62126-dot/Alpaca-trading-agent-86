@@ -30,6 +30,15 @@ from trade_gate import assess_market_regime, build_technical_plan
 from research_gate import ResearchGate
 from decision_intelligence import DecisionIntelligenceAgent
 from intraday_intelligence import IntradayContextAgent
+from advanced_system import (
+    AdvancedDecisionEngine,
+    AdvancedFeatureStore,
+    ChampionChallengerLab,
+    MarketRegimeClassifier,
+    PortfolioRiskModel,
+    AdvancedOpportunityRouter,
+    build_feature_vector,
+)
 
 
 # ---------------------------
@@ -72,6 +81,13 @@ MAX_DAILY_CHASE_PCT = float(os.getenv("MAX_DAILY_CHASE_PCT", "2.5")) / 100.0
 INTRADAY_CONTEXT_ENABLED = os.getenv("INTRADAY_CONTEXT_ENABLED", "true").lower() == "true"
 INTRADAY_CONTEXT_CACHE_SECONDS = int(os.getenv("INTRADAY_CONTEXT_CACHE_SECONDS", "180"))
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "1.0")) / 100.0
+ADVANCED_SYSTEM_ENABLED = os.getenv("ADVANCED_SYSTEM_ENABLED", "true").lower() == "true"
+ADVANCED_MIN_STRATEGY_SCORE = float(os.getenv("ADVANCED_MIN_STRATEGY_SCORE", "60"))
+ADVANCED_MIN_PROBABILITY = float(os.getenv("ADVANCED_MIN_PROBABILITY", "0.50"))
+ADVANCED_MIN_EV_PCT = float(os.getenv("ADVANCED_MIN_EV_PCT", "0.0"))
+PORTFOLIO_MAX_SECTOR_POSITIONS = int(os.getenv("PORTFOLIO_MAX_SECTOR_POSITIONS", "2"))
+PORTFOLIO_MAX_CORRELATION = float(os.getenv("PORTFOLIO_MAX_CORRELATION", "0.90"))
+CHALLENGER_MIN_SAMPLE = int(os.getenv("CHALLENGER_MIN_SAMPLE", "30"))
 SCOUT_TOP_N = int(os.getenv("SCOUT_TOP_N", "3"))
 PERFORMANCE_DAYS = int(os.getenv("PERFORMANCE_DAYS", "7"))
 PERFORMANCE_MIN_TRADES = int(os.getenv("PERFORMANCE_MIN_TRADES", "10"))
@@ -133,6 +149,29 @@ decision_intelligence = DecisionIntelligenceAgent(
     max_chase_pct=MAX_DAILY_CHASE_PCT,
 )
 intraday_context = IntradayContextAgent(data, cache_seconds=INTRADAY_CONTEXT_CACHE_SECONDS)
+advanced_store = AdvancedFeatureStore(journal.connection)
+advanced_regime_classifier = MarketRegimeClassifier()
+advanced_router = AdvancedOpportunityRouter(
+    minimum_signal_score=MIN_SIGNAL_SCORE,
+    minimum_strategy_score=ADVANCED_MIN_STRATEGY_SCORE,
+    top_n=SCOUT_TOP_N,
+)
+advanced_portfolio = PortfolioRiskModel(
+    max_sector_positions=PORTFOLIO_MAX_SECTOR_POSITIONS,
+    max_pair_correlation=PORTFOLIO_MAX_CORRELATION,
+)
+advanced_engine = AdvancedDecisionEngine(
+    advanced_store,
+    take_profit_pct=TAKE_PROFIT_PCT,
+    stop_loss_pct=STOP_LOSS_PCT,
+    minimum_strategy_score=ADVANCED_MIN_STRATEGY_SCORE,
+    minimum_probability=ADVANCED_MIN_PROBABILITY,
+    minimum_expected_value_pct=ADVANCED_MIN_EV_PCT,
+)
+research_lab = ChampionChallengerLab(
+    advanced_store,
+    minimum_sample=CHALLENGER_MIN_SAMPLE,
+)
 _clock_degraded = False
 _verified_open_until = None
 
@@ -242,6 +281,9 @@ def run_after_hours_learning():
     )
     report = after_hours_agent.run(bars_by_symbol, current)
     AfterHoursLearningAgent.log_summary(report)
+    if ADVANCED_SYSTEM_ENABLED:
+        lab_report = research_lab.run()
+        ChampionChallengerLab.log_summary(lab_report)
 
 
 def submit_buy(symbol, price, notional, score=0, rationale=None):
@@ -338,6 +380,21 @@ def run_cycle():
     orders = open_orders()
     snapshot = market_data_agent.fetch([*pos, *SYMBOLS, *MARKET_BENCHMARKS], held_symbols=pos)
     bars_by_symbol = snapshot.bars
+    advanced_regime = advanced_regime_classifier.classify(
+        bars_by_symbol, MARKET_BENCHMARKS
+    )
+    if ADVANCED_SYSTEM_ENABLED:
+        current_prices = {
+            symbol: float(bars["close"].iloc[-1])
+            for symbol, bars in bars_by_symbol.items()
+            if bars is not None and not bars.empty
+        }
+        resolved_updates = advanced_store.update_counterfactuals(current_prices)
+        print(
+            f"[ADVANCED REGIME] {advanced_regime.name} trend={advanced_regime.trend} "
+            f"vol={advanced_regime.volatility} breadth={advanced_regime.breadth:.2f} "
+            f"counterfactual_updates={resolved_updates}"
+        )
     if snapshot.transport_ok:
         guardian.record_success('market_data')
     else:
@@ -372,7 +429,15 @@ def run_cycle():
     regime = assess_market_regime(bars_by_symbol, MARKET_BENCHMARKS)
     print(f"[MARKET REGIME] {'PASS' if regime.allowed else 'BLOCK'}: {regime.reason}; weak={list(regime.weak_benchmarks)}")
     ranked = scout.rank({s: b for s, b in bars_by_symbol.items() if s in SYMBOLS and s not in pos})
-    candidates = scout.candidates(ranked)
+    if ADVANCED_SYSTEM_ENABLED:
+        routed = advanced_router.route(ranked, bars_by_symbol, advanced_regime)
+        candidates = [candidate.opportunity for candidate in routed]
+        routed_strategy = {
+            candidate.opportunity.symbol: candidate.strategy for candidate in routed
+        }
+    else:
+        candidates = scout.candidates(ranked)
+        routed_strategy = {item.symbol: "dip_reversal" for item in candidates}
     selected = {item.symbol for item in candidates}
     for item in ranked:
         if item.symbol not in selected:
@@ -387,9 +452,34 @@ def run_cycle():
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason=reason)
+            if ADVANCED_SYSTEM_ENABLED:
+                basic_features = build_feature_vector(item, regime=advanced_regime)
+                portfolio_assessment = advanced_portfolio.assess(
+                    item.symbol, pos, bars_by_symbol
+                )
+                shadow_meta = advanced_engine.evaluate(
+                    basic_features, advanced_regime, portfolio_assessment
+                )
+                advanced_store.record_opportunity(
+                    symbol=item.symbol,
+                    decision="REJECT_PREFILTER",
+                    strategy=shadow_meta.strategy,
+                    regime=advanced_regime.name,
+                    price=item.price,
+                    score=item.signal.score,
+                    probability=shadow_meta.probability,
+                    expected_value_pct=shadow_meta.expected_value_pct,
+                    features=basic_features,
+                    reason=reason,
+                )
     print('[SCOUT] ' + ', '.join(
-        f"{item.symbol}:{item.signal.score}:{'READY' if item.entry_ready else 'WAIT'}"
+        f"{item.symbol}:{item.signal.score}:{'SELECTED' if item.symbol in selected else 'WAIT'}"
         for item in ranked[:5]))
+    if ADVANCED_SYSTEM_ENABLED and candidates:
+        print('[STRATEGY ROUTER] ' + ', '.join(
+            f"{item.symbol}:{routed_strategy.get(item.symbol, 'unknown')}"
+            for item in candidates
+        ))
     # Execute in rank order, rather than watchlist order.
     for item in candidates:
         if not regime.allowed:
@@ -431,6 +521,7 @@ def run_cycle():
                                      market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                      decision='REJECT', rejection_reason='intraday context: ' + intraday.reason)
                 continue
+        intelligence = None
         if INTELLIGENCE_GATE_ENABLED:
             intelligence = decision_intelligence.review(item.symbol, current_price=item.price)
             tech = intelligence.technical
@@ -460,6 +551,7 @@ def run_cycle():
                     rejection_reason='decision intelligence: ' + intelligence.reason,
                 )
                 continue
+        research = None
         if RESEARCH_GATE_ENABLED:
             try:
                 research = research_gate.review(item.symbol)
@@ -477,6 +569,56 @@ def run_cycle():
                                      market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                      decision='REJECT', rejection_reason='research gate: ' + research.reason)
                 continue
+        if ADVANCED_SYSTEM_ENABLED:
+            features = build_feature_vector(
+                item,
+                plan=plan,
+                intraday=intraday,
+                intelligence=intelligence,
+                research=research,
+                regime=advanced_regime,
+            )
+            portfolio_assessment = advanced_portfolio.assess(
+                item.symbol, pos, bars_by_symbol
+            )
+            meta = advanced_engine.evaluate(
+                features, advanced_regime, portfolio_assessment
+            )
+            vote_text = ",".join(
+                f"{vote.name}:{vote.score:.0f}" for vote in meta.votes[:3]
+            )
+            print(
+                f"[META DECISION] {item.symbol} {'PASS' if meta.allowed else 'BLOCK'} "
+                f"strategy={meta.strategy} regime={meta.regime} "
+                f"p={meta.probability:.3f} ev={meta.expected_value_pct:.3f}% "
+                f"cal_n={meta.calibration_sample} votes={vote_text} "
+                f"portfolio={meta.portfolio_reason} reason={meta.reason}"
+            )
+            advanced_store.record_opportunity(
+                symbol=item.symbol,
+                decision="ADVANCED_PASS" if meta.allowed else "ADVANCED_BLOCK",
+                strategy=meta.strategy,
+                regime=meta.regime,
+                price=item.price,
+                score=item.signal.score,
+                probability=meta.probability,
+                expected_value_pct=meta.expected_value_pct,
+                features=features,
+                reason=meta.reason,
+            )
+            if not meta.allowed:
+                journal.record_cycle(
+                    symbol=item.symbol,
+                    current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]),
+                    signal=item.signal,
+                    decision='REJECT',
+                    rejection_reason='advanced meta-decision: ' + meta.reason,
+                )
+                continue
+        else:
+            meta = None
+
         block = execution.entry_block(item.symbol, cooldown_minutes=ENTRY_COOLDOWN_MINUTES,
                                       daily_entries=MAX_DAILY_ENTRIES)
         risk = risk_agent.assess(score=item.signal.score, positions=pos, daily_pnl=pnl,
@@ -487,6 +629,13 @@ def run_cycle():
                                  decision='REJECT', rejection_reason=block or risk.reason)
             continue
         rationale_parts = [f"signal_score={item.signal.score}", "technical_quality=passed"]
+        if meta is not None:
+            rationale_parts.extend([
+                f"strategy={meta.strategy}",
+                f"regime={meta.regime}",
+                f"probability={meta.probability:.3f}",
+                f"expected_value_pct={meta.expected_value_pct:.3f}",
+            ])
         if intraday is not None:
             rationale_parts.append(f"intraday_alignment={intraday.alignment}")
         if INTELLIGENCE_GATE_ENABLED:
@@ -531,7 +680,16 @@ def run():
         f'cache={INTRADAY_CONTEXT_CACHE_SECONDS}s; '
         f'max_risk_per_trade={MAX_RISK_PER_TRADE_PCT*100:.2f}%'
     )
-    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Multi-Timeframe Intraday Context, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
+    print(
+        f'Advanced system: {"enabled" if ADVANCED_SYSTEM_ENABLED else "disabled"}; '
+        f'min_strategy={ADVANCED_MIN_STRATEGY_SCORE:.0f}; '
+        f'min_probability={ADVANCED_MIN_PROBABILITY:.2f}; '
+        f'min_ev={ADVANCED_MIN_EV_PCT:.3f}%; '
+        f'sector_limit={PORTFOLIO_MAX_SECTOR_POSITIONS}; '
+        f'max_corr={PORTFOLIO_MAX_CORRELATION:.2f}; '
+        f'challenger_min_n={CHALLENGER_MIN_SAMPLE}'
+    )
+    print('[AGENT TEAM] Scout, Market Regime, Technical Quality Gate, Multi-Timeframe Intraday Context, Daily Technical Intelligence, SEC Fundamental Scanner, Quant Screen, Strategy Ensemble, Probability Calibration, Meta Decision, Portfolio Correlation Risk, Counterfactual Tracker, Champion-Challenger Lab, Trusted Research, Execution, Risk, Exit, Performance, After-Hours Research, Data Quality, Guardian, Research Validation')
     last_summary_date = last_after_hours_date = None
     while True:
         try:
