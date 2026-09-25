@@ -30,6 +30,7 @@ from trade_gate import assess_market_regime, build_technical_plan
 from research_gate import ResearchGate
 from decision_intelligence import DecisionIntelligenceAgent
 from intraday_intelligence import IntradayContextAgent
+from quote_intelligence import LevelOneQuoteAgent
 from advanced_system import (
     AdvancedDecisionEngine,
     AdvancedFeatureStore,
@@ -82,6 +83,10 @@ MAX_DAILY_CHASE_PCT = float(os.getenv("MAX_DAILY_CHASE_PCT", "2.5")) / 100.0
 INTRADAY_CONTEXT_ENABLED = os.getenv("INTRADAY_CONTEXT_ENABLED", "true").lower() == "true"
 INTRADAY_CONTEXT_CACHE_SECONDS = int(os.getenv("INTRADAY_CONTEXT_CACHE_SECONDS", "180"))
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "1.0")) / 100.0
+LEVEL1_QUOTES_ENABLED = os.getenv("LEVEL1_QUOTES_ENABLED", "true").lower() == "true"
+MAX_QUOTE_AGE_SECONDS = int(os.getenv("MAX_QUOTE_AGE_SECONDS", "120"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "30"))
+MAX_QUOTE_DISLOCATION_PCT = float(os.getenv("MAX_QUOTE_DISLOCATION_PCT", "1.0")) / 100.0
 ADVANCED_SYSTEM_ENABLED = os.getenv("ADVANCED_SYSTEM_ENABLED", "true").lower() == "true"
 ADVANCED_MIN_STRATEGY_SCORE = float(os.getenv("ADVANCED_MIN_STRATEGY_SCORE", "60"))
 ADVANCED_MIN_PROBABILITY = float(os.getenv("ADVANCED_MIN_PROBABILITY", "0.50"))
@@ -150,6 +155,7 @@ decision_intelligence = DecisionIntelligenceAgent(
     max_chase_pct=MAX_DAILY_CHASE_PCT,
 )
 intraday_context = IntradayContextAgent(data, cache_seconds=INTRADAY_CONTEXT_CACHE_SECONDS)
+quote_agent = LevelOneQuoteAgent(data, max_age_seconds=MAX_QUOTE_AGE_SECONDS)
 advanced_store = AdvancedFeatureStore(journal.connection)
 advanced_regime_classifier = MarketRegimeClassifier()
 advanced_router = AdvancedOpportunityRouter(
@@ -287,12 +293,12 @@ def run_after_hours_learning():
         ChampionChallengerLab.log_summary(lab_report)
 
 
-def submit_buy(symbol, price, notional, score=0, rationale=None):
+def submit_buy(symbol, price, notional, score=0, rationale=None, reference_price=None):
     notional = float(notional)
     if not math.isfinite(notional) or not 1 <= notional <= MAX_TRADE_NOTIONAL:
         raise ValueError('Buy notional is outside configured limits')
     order = execution.submit(symbol, 'buy', score=score, notional=round(notional, 2),
-                             reference_price=price, rationale=rationale)
+                             reference_price=reference_price or price, rationale=rationale)
     print(f"[PAPER BUY SUBMITTED] {symbol} ${notional:.2f} order={order.id}")
     return order, notional
 
@@ -500,8 +506,47 @@ def run_cycle():
             f"{item.symbol}:{routed_strategy.get(item.symbol, 'unknown')}"
             for item in candidates
         ))
+    quote_map = {}
+    if LEVEL1_QUOTES_ENABLED and candidates:
+        quote_map = quote_agent.fetch([item.symbol for item in candidates])
+        ready_quotes = sum(1 for quote in quote_map.values() if quote.available)
+        print(f"[LEVEL1 QUOTES] ready={ready_quotes}/{len(candidates)}")
     # Execute in rank order, rather than watchlist order.
     for item in candidates:
+        quote = quote_map.get(item.symbol)
+        if LEVEL1_QUOTES_ENABLED:
+            if quote is None or not quote.available:
+                reason = quote.reason if quote is not None else "quote missing"
+                journal.record_cycle(
+                    symbol=item.symbol, current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                    decision='REJECT', rejection_reason='level-1 quote: ' + reason,
+                )
+                print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
+                continue
+            if quote.spread_bps is None or quote.spread_bps > MAX_SPREAD_BPS:
+                reason = f"spread {quote.spread_bps if quote.spread_bps is not None else 'n/a'}bps exceeds {MAX_SPREAD_BPS:.1f}bps"
+                journal.record_cycle(
+                    symbol=item.symbol, current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                    decision='REJECT', rejection_reason='level-1 quote: ' + reason,
+                )
+                print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
+                continue
+            dislocation = abs(float(quote.mid) / float(item.price) - 1.0)
+            if dislocation > MAX_QUOTE_DISLOCATION_PCT:
+                reason = f"live quote differs {dislocation*100:.2f}% from last completed bar"
+                journal.record_cycle(
+                    symbol=item.symbol, current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                    decision='REJECT', rejection_reason='level-1 quote: ' + reason,
+                )
+                print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
+                continue
+            print(
+                f"[LEVEL1 GATE] {item.symbol} PASS bid={quote.bid:.4f} ask={quote.ask:.4f} "
+                f"spread={quote.spread_bps:.2f}bps"
+            )
         if not regime.allowed:
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
@@ -609,6 +654,7 @@ def run_cycle():
                 intelligence=intelligence,
                 research=research,
                 regime=advanced_regime,
+                quote=quote,
             )
             portfolio_assessment = advanced_portfolio.assess(
                 item.symbol, pos, bars_by_symbol
@@ -677,9 +723,12 @@ def run_cycle():
             )
         if RESEARCH_GATE_ENABLED:
             rationale_parts.append("trusted_research=passed")
+        if quote is not None and quote.available:
+            rationale_parts.append(f"spread_bps={quote.spread_bps:.2f}")
         order, notional = submit_buy(
             item.symbol, item.price, risk.notional, item.signal.score,
             rationale="; ".join(rationale_parts),
+            reference_price=quote.ask if quote is not None and quote.available else item.price,
         )
         journal.record_cycle(symbol=item.symbol, current_price=item.price,
                              market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
@@ -711,6 +760,11 @@ def run():
         f'Intraday context: {"enabled" if INTRADAY_CONTEXT_ENABLED else "disabled"}; '
         f'cache={INTRADAY_CONTEXT_CACHE_SECONDS}s; '
         f'max_risk_per_trade={MAX_RISK_PER_TRADE_PCT*100:.2f}%'
+    )
+    print(
+        f'Level-1 quotes: {"enabled" if LEVEL1_QUOTES_ENABLED else "disabled"}; '
+        f'max_age={MAX_QUOTE_AGE_SECONDS}s; max_spread={MAX_SPREAD_BPS:.1f}bps; '
+        f'max_dislocation={MAX_QUOTE_DISLOCATION_PCT*100:.2f}%'
     )
     print(
         f'Advanced system: {"enabled" if ADVANCED_SYSTEM_ENABLED else "disabled"}; '
