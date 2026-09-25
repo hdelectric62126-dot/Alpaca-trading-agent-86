@@ -38,6 +38,7 @@ from advanced_system import (
     PortfolioRiskModel,
     AdvancedOpportunityRouter,
     build_feature_vector,
+    strategy_quality_decision,
 )
 
 
@@ -428,9 +429,25 @@ def run_cycle():
             exit_agent.clear(symbol)
     regime = assess_market_regime(bars_by_symbol, MARKET_BENCHMARKS)
     print(f"[MARKET REGIME] {'PASS' if regime.allowed else 'BLOCK'}: {regime.reason}; weak={list(regime.weak_benchmarks)}")
+    catalyst_map = {}
+    if ADVANCED_SYSTEM_ENABLED and RESEARCH_GATE_ENABLED:
+        try:
+            catalyst_map = research_gate.scan_watchlist(SYMBOLS)
+            active_catalysts = sum(1 for value in catalyst_map.values() if value.get("count", 0))
+            risky_catalysts = sum(1 for value in catalyst_map.values() if value.get("risky_count", 0))
+            print(
+                f"[CATALYST SCANNER] active={active_catalysts} risky={risky_catalysts} "
+                f"symbols={len(catalyst_map)}"
+            )
+        except Exception as exc:
+            print(f"[CATALYST SCANNER] unavailable {type(exc).__name__}; price strategies continue")
+            catalyst_map = {}
+
     ranked = scout.rank({s: b for s, b in bars_by_symbol.items() if s in SYMBOLS and s not in pos})
     if ADVANCED_SYSTEM_ENABLED:
-        routed = advanced_router.route(ranked, bars_by_symbol, advanced_regime)
+        routed = advanced_router.route(
+            ranked, bars_by_symbol, advanced_regime, catalysts=catalyst_map
+        )
         candidates = [candidate.opportunity for candidate in routed]
         routed_strategy = {
             candidate.opportunity.symbol: candidate.strategy for candidate in routed
@@ -454,6 +471,9 @@ def run_cycle():
                                  decision='REJECT', rejection_reason=reason)
             if ADVANCED_SYSTEM_ENABLED:
                 basic_features = build_feature_vector(item, regime=advanced_regime)
+                catalyst = catalyst_map.get(item.symbol, {})
+                basic_features["news_count"] = int(catalyst.get("count", 0) or 0)
+                basic_features["catalyst_risky"] = int(catalyst.get("risky_count", 0) or 0) > 0
                 portfolio_assessment = advanced_portfolio.assess(
                     item.symbol, pos, bars_by_symbol
                 )
@@ -501,13 +521,25 @@ def run_cycle():
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
                                  decision='REJECT', rejection_reason='technical gate unavailable: ' + str(exc))
             continue
-        print(f"[QUALITY GATE] {item.symbol} {'PASS' if plan.allowed else 'BLOCK'} "
-              f"rr={plan.reward_risk:.2f} vol={plan.volume_ratio:.2f}x "
-              f"atr={plan.atr_pct*100:.2f}% vwap={'YES' if plan.vwap_reclaimed else 'NO'}")
-        if not plan.allowed:
+        pre_strategy = routed_strategy.get(item.symbol, "dip_reversal")
+        if ADVANCED_SYSTEM_ENABLED:
+            quality_allowed, quality_reason = strategy_quality_decision(
+                pre_strategy,
+                item,
+                plan,
+                min_volume_ratio=MIN_RELATIVE_VOLUME,
+                max_atr_pct=MAX_ATR_PCT,
+            )
+        else:
+            quality_allowed, quality_reason = plan.allowed, plan.reason
+        print(f"[QUALITY GATE] {item.symbol} {'PASS' if quality_allowed else 'BLOCK'} "
+              f"strategy={pre_strategy} rr={plan.reward_risk:.2f} "
+              f"vol={plan.volume_ratio:.2f}x atr={plan.atr_pct*100:.2f}% "
+              f"vwap={'YES' if plan.vwap_reclaimed else 'NO'} reason={quality_reason}")
+        if not quality_allowed:
             journal.record_cycle(symbol=item.symbol, current_price=item.price,
                                  market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
-                                 decision='REJECT', rejection_reason='technical gate: ' + plan.reason)
+                                 decision='REJECT', rejection_reason='technical gate: ' + quality_reason)
             continue
         intraday = None
         if INTRADAY_CONTEXT_ENABLED:

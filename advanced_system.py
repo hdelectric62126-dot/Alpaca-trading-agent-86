@@ -429,14 +429,17 @@ class StrategyEnsemble:
                 + (10 if momentum > 0 else -5),
             ),
         )
+        research_state = features.get("research_passed")
+        research_adjustment = 10 if research_state is True else (-25 if research_state is False else 0)
         catalyst = max(
             0.0,
             min(
                 100.0,
-                35
-                + min(25, int(features.get("news_count", 0)) * 8)
-                + min(20, int(features.get("filing_count", 0)) * 5)
-                + (10 if features.get("research_passed") else -20),
+                50
+                + min(40, int(features.get("news_count", 0)) * 18)
+                + min(15, int(features.get("filing_count", 0)) * 5)
+                + research_adjustment
+                - (40 if features.get("catalyst_risky") else 0),
             ),
         )
 
@@ -472,7 +475,8 @@ class AdvancedOpportunityRouter:
         self.top_n = max(1, int(top_n))
         self.ensemble = StrategyEnsemble()
 
-    def route(self, opportunities, bars_by_symbol, regime):
+    def route(self, opportunities, bars_by_symbol, regime, catalysts=None):
+        catalysts = catalysts or {}
         routed = []
         for item in opportunities:
             bars = bars_by_symbol.get(item.symbol)
@@ -483,10 +487,13 @@ class AdvancedOpportunityRouter:
             latest_green = float(bars["close"].iloc[-1]) > float(bars["open"].iloc[-1])
             prior_high = float(bars["high"].astype(float).iloc[-20:-1].max())
             features = build_feature_vector(item, regime=regime)
+            catalyst = catalysts.get(item.symbol, {})
             features.update(
                 {
                     "latest_green": latest_green,
                     "room_to_resistance_pct": max(0.0, (prior_high / latest - 1.0) * 100.0),
+                    "news_count": int(catalyst.get("count", 0) or 0),
+                    "catalyst_risky": int(catalyst.get("risky_count", 0) or 0) > 0,
                 }
             )
             votes = self.ensemble.vote(features)
@@ -522,10 +529,21 @@ class AdvancedOpportunityRouter:
                     and above_vwap and positive_momentum and latest_green
                 )
                 reason = "trend specialist nominated setup"
+            elif winner.name == "catalyst":
+                news_count = int(features.get("news_count", 0) or 0)
+                catalyst_risky = bool(features.get("catalyst_risky", False))
+                ready = (
+                    news_count > 0
+                    and not catalyst_risky
+                    and item.signal.score >= max(40, self.minimum_signal_score - 20)
+                    and strategy_ok
+                    and above_vwap
+                    and latest_green
+                    and rvol >= 1.0
+                )
+                reason = "catalyst specialist nominated setup from fresh watchlist news"
             else:
-                # Catalyst setups require trusted news/filing evidence and are
-                # therefore evaluated later, not nominated from price alone.
-                reason = "catalyst requires research evidence"
+                reason = "no specialist nominated setup"
 
             if ready:
                 routed.append(
@@ -546,6 +564,51 @@ class AdvancedOpportunityRouter:
             reverse=True,
         )
         return routed[: self.top_n]
+
+
+def strategy_quality_decision(
+    strategy,
+    item,
+    plan,
+    *,
+    min_volume_ratio=1.0,
+    max_atr_pct=0.02,
+):
+    """Apply quality rules suited to the strategy instead of one universal gate."""
+    if strategy in {"dip_reversal", "mean_reversion"}:
+        return bool(plan.allowed), plan.reason
+
+    common_failures = []
+    if not plan.latest_green:
+        common_failures.append("latest completed bar is not green")
+    if not plan.vwap_reclaimed:
+        common_failures.append("price has not reclaimed VWAP")
+    if not plan.recovery_trend_up:
+        common_failures.append("recovery trend is not improving")
+    if plan.volume_ratio < min_volume_ratio:
+        common_failures.append(
+            f"relative volume {plan.volume_ratio:.2f}x is below {min_volume_ratio:.2f}x"
+        )
+    if plan.atr_pct > max_atr_pct:
+        common_failures.append(
+            f"ATR {plan.atr_pct * 100:.2f}% exceeds {max_atr_pct * 100:.2f}%"
+        )
+
+    if strategy == "breakout":
+        if float(item.price) < float(plan.resistance) * 0.995:
+            common_failures.append("price has not reached the breakout zone")
+    elif strategy in {"momentum", "trend_following", "catalyst"}:
+        if plan.reward_risk < 0.50:
+            common_failures.append(
+                f"reward/risk {plan.reward_risk:.2f} is below strategy floor 0.50"
+            )
+
+    return (
+        not common_failures,
+        "strategy-aware quality gate passed"
+        if not common_failures
+        else "; ".join(common_failures),
+    )
 
 
 class PortfolioRiskModel:
