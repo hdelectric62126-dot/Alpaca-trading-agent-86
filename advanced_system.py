@@ -436,7 +436,7 @@ class StrategyEnsemble:
             min(
                 100.0,
                 50
-                + min(30, int(features.get("news_count", 0)) * 12)
+                + min(40, int(features.get("news_count", 0)) * 18)
                 + min(15, int(features.get("filing_count", 0)) * 5)
                 + research_adjustment
                 - (40 if features.get("catalyst_risky") else 0),
