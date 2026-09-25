@@ -74,6 +74,7 @@ class ResearchGate:
         )
         self.session = requests.Session()
         self._decision_cache = {}
+        self._watchlist_news_cache = {}
         self._ticker_cache = None
         self._ticker_cache_at = 0.0
 
@@ -115,6 +116,72 @@ class ResearchGate:
             if headline_has_risk(combined):
                 risky.append(str(row.get("headline", "")).strip() or "risk-language news item")
         return headlines, tuple(risky)
+
+    def scan_watchlist(self, symbols, *, now=None):
+        """Fetch recent watchlist news in one Alpaca request.
+
+        This is an opportunity-discovery input only. Risk-language items are
+        flagged and the per-symbol ResearchGate.review still performs the final
+        trusted news + SEC gate before any order can be submitted.
+        """
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        normalized = tuple(sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}))
+        if not normalized:
+            return {}
+        key = normalized
+        now_mono = time.monotonic()
+        cached = self._watchlist_news_cache.get(key)
+        if cached and now_mono - cached[0] < self.cache_seconds:
+            return cached[1]
+
+        start = now - timedelta(minutes=self.news_lookback_minutes)
+        response = self.session.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            headers=self._headers_alpaca(),
+            params={
+                "symbols": ",".join(normalized),
+                "start": start.isoformat(),
+                "end": now.isoformat(),
+                "sort": "desc",
+                "limit": 50,
+                "include_content": "false",
+            },
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        articles = payload.get("news", []) if isinstance(payload, dict) else []
+
+        result = {
+            symbol: {"headlines": (), "count": 0, "risky_count": 0}
+            for symbol in normalized
+        }
+        buckets = {symbol: [] for symbol in normalized}
+        risky = {symbol: 0 for symbol in normalized}
+        for row in articles:
+            headline = str(row.get("headline", "")).strip()
+            summary = str(row.get("summary", "")).strip()
+            article_symbols = {
+                str(symbol).strip().upper()
+                for symbol in (row.get("symbols") or [])
+                if str(symbol).strip()
+            }
+            for symbol in article_symbols.intersection(normalized):
+                if headline:
+                    buckets[symbol].append(headline)
+                if headline_has_risk(f"{headline} {summary}"):
+                    risky[symbol] += 1
+
+        for symbol in normalized:
+            result[symbol] = {
+                "headlines": tuple(buckets[symbol][:10]),
+                "count": len(buckets[symbol]),
+                "risky_count": risky[symbol],
+            }
+        self._watchlist_news_cache[key] = (now_mono, result)
+        return result
 
     def _ticker_map(self):
         now_mono = time.monotonic()
