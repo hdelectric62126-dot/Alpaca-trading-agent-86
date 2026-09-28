@@ -2,6 +2,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
+from requests import ReadTimeout
+
 from research_gate import ResearchGate, headline_has_risk, recent_material_filings
 
 
@@ -62,6 +64,33 @@ class ResearchGateTests(unittest.TestCase):
             lookback_days=1,
         )
         self.assertEqual(result, ())
+
+
+    def test_sec_unavailable_degrades_but_does_not_block_clean_setup(self):
+        gate = ResearchGate("key", "secret", cache_seconds=0)
+        gate._news = Mock(return_value=(("Company announces new product launch",), ()))
+        gate._filings = Mock(side_effect=ReadTimeout("SEC timed out"))
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+
+        decision = gate.review("AMD", now=now)
+
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.sources_ok)
+        self.assertIn("trusted research degraded", decision.reason)
+        self.assertIn("SEC unavailable: ReadTimeout", decision.reason)
+
+    def test_material_sec_filing_still_blocks(self):
+        gate = ResearchGate("key", "secret", cache_seconds=0)
+        gate._news = Mock(return_value=(("Company announces new product launch",), ()))
+        gate._filings = Mock(return_value=("8-K filed 2026-09-28",))
+        now = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+
+        decision = gate.review("AMD", now=now)
+
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.sources_ok)
+        self.assertIn("recent material SEC filing", decision.reason)
+
 
 
 if __name__ == "__main__":
