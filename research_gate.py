@@ -234,6 +234,7 @@ class ResearchGate:
             return cached[1]
 
         issues = []
+        blocking_issues = []
         news_headlines = ()
         recent_filings = ()
         sources_ok = True
@@ -241,22 +242,39 @@ class ResearchGate:
         try:
             news_headlines, risky_news = self._news(key, now)
             if risky_news:
-                issues.append("risk-language news: " + " | ".join(risky_news[:3]))
+                message = "risk-language news: " + " | ".join(risky_news[:3])
+                issues.append(message)
+                blocking_issues.append(message)
         except Exception as exc:
             sources_ok = False
-            issues.append("news unavailable: " + type(exc).__name__)
+            message = "news unavailable: " + type(exc).__name__
+            issues.append(message)
+            blocking_issues.append(message)
 
         try:
             recent_filings = self._filings(key, now)
             if recent_filings:
-                issues.append("recent material SEC filing: " + " | ".join(recent_filings[:3]))
+                message = "recent material SEC filing: " + " | ".join(recent_filings[:3])
+                issues.append(message)
+                blocking_issues.append(message)
         except Exception as exc:
+            # SEC transport/service failures are degraded evidence, not evidence
+            # against the trade. Keep the failure visible to downstream
+            # telemetry, but do not let an external outage become a hard veto.
             sources_ok = False
             issues.append("SEC unavailable: " + type(exc).__name__)
 
+        allowed = not blocking_issues
+        if not issues:
+            reason = "trusted research passed"
+        elif allowed:
+            reason = "trusted research degraded: " + "; ".join(issues)
+        else:
+            reason = "; ".join(issues)
+
         decision = ResearchDecision(
-            allowed=sources_ok and not issues,
-            reason="trusted research passed" if sources_ok and not issues else "; ".join(issues),
+            allowed=allowed,
+            reason=reason,
             news_headlines=news_headlines,
             recent_filings=recent_filings,
             sources_ok=sources_ok,
