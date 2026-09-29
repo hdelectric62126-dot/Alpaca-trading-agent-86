@@ -1,8 +1,9 @@
 """Batch Level-1 quote intelligence for execution-quality checks.
 
-Uses Alpaca's latest best bid/ask quote endpoint through alpaca-py. The module
-never submits orders. It validates quote freshness and computes spread cost in
-basis points for the decision engine and slippage journal.
+Uses Alpaca's latest best bid/ask quote endpoint through alpaca-py. It prefers
+the consolidated SIP feed and falls back to IEX when SIP entitlement is unavailable.
+The module never submits orders. It validates quote freshness and computes spread
+cost in basis points for the decision engine and slippage journal.
 """
 
 from dataclasses import dataclass
