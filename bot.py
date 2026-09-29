@@ -524,8 +524,9 @@ def run_cycle():
                 )
                 print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
                 continue
-            if quote.spread_bps is None or quote.spread_bps > MAX_SPREAD_BPS:
-                reason = f"spread {quote.spread_bps if quote.spread_bps is not None else 'n/a'}bps exceeds {MAX_SPREAD_BPS:.1f}bps"
+            quote_feed = (quote.feed or "unknown").lower()
+            if quote.spread_bps is None:
+                reason = "spread unavailable"
                 journal.record_cycle(
                     symbol=item.symbol, current_price=item.price,
                     market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
@@ -533,9 +534,27 @@ def run_cycle():
                 )
                 print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
                 continue
-            dislocation = abs(float(quote.mid) / float(item.price) - 1.0)
+            # SIP is consolidated and safe for a hard spread gate. IEX is only one
+            # exchange, so a wide IEX spread can be a false liquidity signal.
+            # On IEX fallback, gate the buy-side ask against the completed-bar
+            # reference instead of rejecting solely because the IEX bid is sparse.
+            if quote.spread_bps > MAX_SPREAD_BPS and quote_feed == "sip":
+                reason = f"SIP spread {quote.spread_bps:.2f}bps exceeds {MAX_SPREAD_BPS:.1f}bps"
+                journal.record_cycle(
+                    symbol=item.symbol, current_price=item.price,
+                    market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
+                    decision='REJECT', rejection_reason='level-1 quote: ' + reason,
+                )
+                print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
+                continue
+
+            live_reference = float(quote.mid) if quote_feed == "sip" else float(quote.ask)
+            dislocation = abs(live_reference / float(item.price) - 1.0)
             if dislocation > MAX_QUOTE_DISLOCATION_PCT:
-                reason = f"live quote differs {dislocation*100:.2f}% from last completed bar"
+                reason = (
+                    f"{quote_feed} quote reference differs {dislocation*100:.2f}% "
+                    "from last completed bar"
+                )
                 journal.record_cycle(
                     symbol=item.symbol, current_price=item.price,
                     market_data=bar_data(bars_by_symbol[item.symbol]), signal=item.signal,
@@ -544,8 +563,8 @@ def run_cycle():
                 print(f"[LEVEL1 GATE] {item.symbol} BLOCK: {reason}")
                 continue
             print(
-                f"[LEVEL1 GATE] {item.symbol} PASS bid={quote.bid:.4f} ask={quote.ask:.4f} "
-                f"spread={quote.spread_bps:.2f}bps"
+                f"[LEVEL1 GATE] {item.symbol} PASS feed={quote_feed} "
+                f"bid={quote.bid:.4f} ask={quote.ask:.4f} spread={quote.spread_bps:.2f}bps"
             )
         if not regime.allowed:
             journal.record_cycle(symbol=item.symbol, current_price=item.price,

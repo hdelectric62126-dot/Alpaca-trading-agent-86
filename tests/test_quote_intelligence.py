@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
+from alpaca.data.enums import DataFeed
 from quote_intelligence import LevelOneQuoteAgent
 
 
@@ -21,6 +22,25 @@ class QuoteIntelligenceTests(unittest.TestCase):
         self.assertAlmostEqual(result["AMD"].mid, 100.05, places=5)
         self.assertAlmostEqual(result["AMD"].spread_bps, 9.995002499, places=5)
         self.assertEqual(client.get_stock_latest_quote.call_count, 1)
+
+
+    def test_sip_failure_falls_back_to_iex(self):
+        now = datetime(2026, 9, 25, 14, 30, tzinfo=timezone.utc)
+        client = Mock()
+
+        def latest_quote(request):
+            if request.feed == DataFeed.SIP:
+                raise RuntimeError("subscription required")
+            return {
+                "AMD": NS(bid_price=99.00, ask_price=100.05, timestamp=now),
+            }
+
+        client.get_stock_latest_quote.side_effect = latest_quote
+        result = LevelOneQuoteAgent(client).fetch(["AMD"], now=now)
+
+        self.assertTrue(result["AMD"].available)
+        self.assertEqual(result["AMD"].feed, "iex")
+        self.assertEqual(client.get_stock_latest_quote.call_count, 2)
 
     def test_stale_quote_fails_closed(self):
         now = datetime(2026, 9, 25, 14, 30, tzinfo=timezone.utc)
