@@ -186,3 +186,5 @@ python report.py --days 1
 python report.py --days 7
 python report.py --days 30
 ```
+
+<!-- Railway deployment resync: 2026-09-30 after account MFA reset. No trading logic changed. -->
