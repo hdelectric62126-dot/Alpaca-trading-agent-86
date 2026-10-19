@@ -679,7 +679,8 @@ def run_cycle():
                 item.symbol, pos, bars_by_symbol
             )
             meta = advanced_engine.evaluate(
-                features, advanced_regime, portfolio_assessment
+                features, advanced_regime, portfolio_assessment,
+                preferred_strategy=pre_strategy,
             )
             vote_text = ",".join(
                 f"{vote.name}:{vote.score:.0f}" for vote in meta.votes[:3]
