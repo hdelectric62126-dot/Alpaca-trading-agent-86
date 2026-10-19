@@ -245,13 +245,34 @@ class AdvancedFeatureStore:
         if horizon not in self.HORIZONS:
             raise ValueError("unsupported calibration horizon")
         field = f"outcome_{horizon}m_pct"
+        # Only decisions that reached the complete entry-quality pipeline are
+        # useful for calibrating the actual strategy. REJECT_PREFILTER rows
+        # never passed the gates and previously polluted the probability model.
         rows = self.db.execute(
-            f"""SELECT {field} AS outcome FROM advanced_opportunities
-                WHERE strategy=? AND regime=? AND {field} IS NOT NULL
-                ORDER BY observed_at DESC LIMIT 500""",
+            f"""SELECT symbol, observed_at, {field} AS outcome
+                FROM advanced_opportunities
+                WHERE strategy=? AND regime=?
+                  AND decision IN ('ADVANCED_PASS', 'ADVANCED_BLOCK')
+                  AND {field} IS NOT NULL
+                ORDER BY observed_at DESC LIMIT 5000""",
             (strategy, regime),
         ).fetchall()
-        outcomes = [float(row["outcome"]) for row in rows if _finite(row["outcome"])]
+        # Repeated scans of one stock a minute are not independent trials.
+        # Take at most one per symbol per outcome horizon. Do not report the
+        # unthinned count as statistically independent evidence.
+        last_selected = {}
+        outcomes = []
+        for row in rows:
+            if not _finite(row["outcome"]):
+                continue
+            observed = datetime.fromisoformat(row["observed_at"])
+            previous = last_selected.get(row["symbol"])
+            if previous is not None and (previous - observed).total_seconds() < horizon * 60:
+                continue
+            outcomes.append(float(row["outcome"]))
+            last_selected[row["symbol"]] = observed
+            if len(outcomes) >= 500:
+                break
         if len(outcomes) < minimum:
             return {"sample": len(outcomes), "probability": None, "expectancy_pct": None}
         # Treat +0.05% as a small friction buffer rather than labeling every
@@ -676,9 +697,12 @@ class AdvancedDecisionEngine:
         self.minimum_expected_value_pct = float(minimum_expected_value_pct)
         self.ensemble = StrategyEnsemble()
 
-    def evaluate(self, features, regime, portfolio_assessment):
+    def evaluate(self, features, regime, portfolio_assessment, *, preferred_strategy=None):
         votes = self.ensemble.vote(features)
-        winner = votes[0]
+        # The specialist nominated by the router must remain the specialist
+        # evaluated by the final gate. Supplemental news/technical features can
+        # otherwise change the winner and apply another model's calibration.
+        winner = next((v for v in votes if v.name == preferred_strategy), votes[0])
         calibration = self.store.calibration(winner.name, regime.name)
 
         # Conservative prior from deterministic strategy quality. Historical
@@ -691,10 +715,27 @@ class AdvancedDecisionEngine:
         )
         historical_cost_pct = self.store.estimated_round_trip_cost_pct()
         spread_bps = features.get("spread_bps")
-        current_spread_cost_pct = (
-            max(0.0, float(spread_bps)) / 100.0
-            if _finite(spread_bps) else 0.0
-        )
+        quote_feed = str(features.get("quote_feed") or "").lower()
+        if quote_feed == "iex":
+            # An IEX best bid can be sparse/non-consolidated. The entry gate
+            # intentionally does not reject purely on its displayed spread,
+            # so the EV model must not silently reuse that spread as cost.
+            # Instead, price the ask premium to the latest completed bar,
+            # with a conservative 10-bp round-trip simulation floor.
+            ask = features.get("ask")
+            reference = features.get("bar_reference_price")
+            if _finite(ask) and _finite(reference) and float(reference) > 0:
+                premium_pct = max(0.0, (float(ask) / float(reference) - 1.0) * 100.0)
+                current_spread_cost_pct = max(0.10, 2.0 * premium_pct)
+            else:
+                # Unknown execution reference is NOT a free fill.
+                current_spread_cost_pct = 0.25
+        else:
+            # Consolidated SIP quotes can use their full observed spread.
+            current_spread_cost_pct = (
+                max(0.0, float(spread_bps)) / 100.0
+                if _finite(spread_bps) else 0.0
+            )
         cost_pct = max(historical_cost_pct, current_spread_cost_pct)
         expected_value_pct = (
             probability * self.take_profit_pct * 100.0
@@ -913,6 +954,8 @@ def build_feature_vector(
                 "ask": quote.ask,
                 "mid": quote.mid,
                 "spread_bps": quote.spread_bps,
+                "quote_feed": quote.feed,
+                "bar_reference_price": float(item.price),
             }
         )
     # SQLite JSON is strict; convert NaN/Inf to null.
